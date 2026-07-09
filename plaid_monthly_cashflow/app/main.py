@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -126,7 +126,17 @@ STORAGE = Storage(CONFIG.local_db_path)
 PLAID = PlaidService(CONFIG.plaid_settings())
 SYNC_LOCK = asyncio.Lock()
 
-app = FastAPI(title="Plaid Monthly Cashflow", version="0.1.0")
+app = FastAPI(title="Plaid Monthly Cashflow", version="0.1.3")
+
+
+@app.middleware("http")
+async def normalize_ingress_path(request: Request, call_next):
+    path = request.scope.get("path", "")
+    if path.startswith("//"):
+        request.scope["path"] = "/" + path.lstrip("/")
+    return await call_next(request)
+
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
