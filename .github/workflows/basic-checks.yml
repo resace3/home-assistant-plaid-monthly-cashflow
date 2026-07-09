@@ -20,7 +20,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r plaid_monthly_cashflow/requirements.txt
-          python -m pip install pyyaml
+          python -m pip install pyyaml pytest httpx
 
       - name: Compile Python files
         run: python -m compileall -q plaid_monthly_cashflow/app
@@ -45,3 +45,6 @@ jobs:
                   yaml.safe_load(handle)
               print(f"{path}: ok")
           PY
+
+      - name: Run unit tests
+        run: PYTHONPATH=plaid_monthly_cashflow pytest -q
