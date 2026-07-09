@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-plaid-python
+plaid-python==40.1.0
 pydantic
 python-dateutil
 cryptography
