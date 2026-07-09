@@ -1,5 +1,5 @@
-ARG BUILD_FROM
-FROM ${BUILD_FROM}
+ARG BUILD_ARCH=aarch64
+FROM ghcr.io/home-assistant/${BUILD_ARCH}-base-python:3.13-alpine3.24
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
