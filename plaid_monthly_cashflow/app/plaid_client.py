@@ -197,11 +197,14 @@ class PlaidService:
             has_more = True
 
             while has_more:
-                request = TransactionsSyncRequest(
-                    access_token=access_token,
-                    cursor=next_cursor,
-                    count=500,
-                )
+                request_args = {
+                    "access_token": access_token,
+                    "count": 500,
+                }
+                if next_cursor is not None:
+                    request_args["cursor"] = next_cursor
+
+                request = TransactionsSyncRequest(**request_args)
                 response = _to_dict(self._get_client().transactions_sync(request)) or {}
                 added.extend(response.get("added") or [])
                 modified.extend(response.get("modified") or [])

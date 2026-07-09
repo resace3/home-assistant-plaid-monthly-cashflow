@@ -130,7 +130,7 @@ STORAGE = Storage(CONFIG.local_db_path)
 PLAID = PlaidService(CONFIG.plaid_settings())
 SYNC_LOCK = asyncio.Lock()
 
-app = FastAPI(title="Plaid Monthly Cashflow", version="0.1.4")
+app = FastAPI(title="Plaid Monthly Cashflow", version="0.1.5")
 
 
 @app.middleware("http")

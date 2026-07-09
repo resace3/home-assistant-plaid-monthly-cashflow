@@ -18,6 +18,39 @@ class CapturePlaidClient:
         return {"link_token": "link-sandbox-test"}
 
 
+class CaptureTransactionsSyncClient:
+    def __init__(self) -> None:
+        self.requests = []
+
+    def transactions_sync(self, request):
+        payload = request.to_dict()
+        self.requests.append(payload)
+        if len(self.requests) == 1:
+            return {
+                "added": [],
+                "modified": [],
+                "removed": [],
+                "next_cursor": "cursor-after-first-page",
+                "has_more": True,
+            }
+        return {
+            "added": [
+                {
+                    "transaction_id": "txn_after_cursor",
+                    "account_id": "acc_checking",
+                    "date": "2026-07-03",
+                    "name": "Coffee",
+                    "amount": 4.5,
+                    "pending": False,
+                }
+            ],
+            "modified": [],
+            "removed": [],
+            "next_cursor": "cursor-after-second-page",
+            "has_more": False,
+        }
+
+
 class FakePlaid:
     def create_link_token(self) -> str:
         return "link-sandbox-test"
@@ -101,6 +134,28 @@ def test_link_token_requests_configured_transaction_history() -> None:
     assert payload["country_codes"] == ["US"]
     assert payload["transactions"]["days_requested"] == 372
     assert payload["redirect_uri"] == "https://example.test/plaid-oauth"
+
+
+def test_first_transactions_sync_omits_null_cursor_then_paginates() -> None:
+    capture = CaptureTransactionsSyncClient()
+    service = PlaidService(
+        PlaidSettings(
+            client_id="client-id-for-tests",
+            secret="secret-for-tests",
+            environment="sandbox",
+            products=["transactions"],
+            country_codes=["US"],
+            sync_months_back=12,
+        )
+    )
+    service._client = capture
+
+    result = service.sync_transactions(access_token="access-token-for-tests", cursor=None)
+
+    assert "cursor" not in capture.requests[0]
+    assert capture.requests[1]["cursor"] == "cursor-after-first-page"
+    assert result["next_cursor"] == "cursor-after-second-page"
+    assert result["added"][0]["transaction_id"] == "txn_after_cursor"
 
 
 def test_configured_app_exchanges_token_syncs_and_summarizes(tmp_path: Path) -> None:
