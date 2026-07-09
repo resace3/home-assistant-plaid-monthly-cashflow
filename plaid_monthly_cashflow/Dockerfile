@@ -1,8 +1,6 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
