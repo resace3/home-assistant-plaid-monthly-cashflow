@@ -27,6 +27,7 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "plaid_client_id": "",
     "plaid_secret": "",
     "plaid_env": "sandbox",
+    "plaid_redirect_uri": "",
     "plaid_products": ["transactions"],
     "plaid_country_codes": ["US"],
     "sync_months_back": 12,
@@ -42,6 +43,7 @@ class AddonConfig:
     plaid_client_id: str
     plaid_secret: str
     plaid_env: str
+    plaid_redirect_uri: str
     plaid_products: list[str]
     plaid_country_codes: list[str]
     sync_months_back: int
@@ -62,6 +64,7 @@ class AddonConfig:
             products=self.plaid_products,
             country_codes=self.plaid_country_codes,
             sync_months_back=self.sync_months_back,
+            redirect_uri=self.plaid_redirect_uri,
             debug_logging=self.debug_logging,
         )
 
@@ -110,6 +113,7 @@ def load_config() -> AddonConfig:
         plaid_client_id=str(options.get("plaid_client_id") or ""),
         plaid_secret=str(options.get("plaid_secret") or ""),
         plaid_env=plaid_env,
+        plaid_redirect_uri=str(options.get("plaid_redirect_uri") or ""),
         plaid_products=products,
         plaid_country_codes=country_codes,
         sync_months_back=max(int(options.get("sync_months_back") or 12), 1),
@@ -126,7 +130,7 @@ STORAGE = Storage(CONFIG.local_db_path)
 PLAID = PlaidService(CONFIG.plaid_settings())
 SYNC_LOCK = asyncio.Lock()
 
-app = FastAPI(title="Plaid Monthly Cashflow", version="0.1.3")
+app = FastAPI(title="Plaid Monthly Cashflow", version="0.1.4")
 
 
 @app.middleware("http")
