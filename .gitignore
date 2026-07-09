@@ -4,14 +4,32 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+coverage/
+htmlcov/
 
 # Local Home Assistant add-on data and secrets.
 data/
+logs/
+*.log
 *.sqlite
+*.sqlite3
+*.db
 *.sqlite-shm
 *.sqlite-wal
+*.db-shm
+*.db-wal
 local_key.key
 options.json
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.bak
+*.backup
+*.tmp
 
 # OS/editor noise.
 .DS_Store

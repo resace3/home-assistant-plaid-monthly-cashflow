@@ -34,6 +34,31 @@ class Storage:
         self.db_path = Path(db_path)
         self.key_path = self.db_path.with_name("local_key.key")
 
+    def _sidecar_paths(self) -> list[Path]:
+        return [Path(str(self.db_path) + "-wal"), Path(str(self.db_path) + "-shm")]
+
+    def _chmod_private(self, *paths: Path) -> None:
+        for path in paths:
+            try:
+                if path.exists():
+                    os.chmod(path, 0o600)
+            except OSError:
+                pass
+
+    def _safe_unlink(self, path: Path) -> None:
+        try:
+            db_parent = self.db_path.parent.resolve(strict=False)
+            resolved = path.resolve(strict=False)
+        except OSError:
+            return
+        if resolved.parent != db_parent:
+            return
+        try:
+            if path.exists() and path.is_file():
+                path.unlink()
+        except OSError:
+            pass
+
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,11 +69,13 @@ class Storage:
             conn.commit()
         finally:
             conn.close()
+            self._chmod_private(self.db_path, *self._sidecar_paths())
 
     def init_db(self) -> None:
         with self.connect() as conn:
             conn.executescript(
                 """
+                PRAGMA secure_delete=ON;
                 PRAGMA journal_mode=WAL;
 
                 CREATE TABLE IF NOT EXISTS settings (
@@ -110,10 +137,21 @@ class Storage:
                 );
                 """
             )
-        try:
-            os.chmod(self.db_path, 0o600)
-        except OSError:
-            pass
+            conn.execute("UPDATE transactions SET raw_json = NULL WHERE raw_json IS NOT NULL")
+            conn.execute(
+                """
+                UPDATE accounts
+                SET name = NULL,
+                    official_name = NULL,
+                    type = NULL,
+                    subtype = NULL,
+                    mask = NULL,
+                    current_balance = NULL,
+                    available_balance = NULL,
+                    iso_currency_code = NULL
+                """
+            )
+        self._chmod_private(self.db_path, *self._sidecar_paths())
 
     def set_setting(self, key: str, value: str) -> None:
         with self.connect() as conn:
@@ -182,7 +220,6 @@ class Storage:
         now = utc_now()
         with self.connect() as conn:
             for account in accounts:
-                balances = account.get("balances") or {}
                 conn.execute(
                     """
                     INSERT INTO accounts (
@@ -205,14 +242,14 @@ class Storage:
                     (
                         account.get("account_id"),
                         item_id,
-                        account.get("name"),
-                        account.get("official_name"),
-                        str(account.get("type")) if account.get("type") is not None else None,
-                        str(account.get("subtype")) if account.get("subtype") is not None else None,
-                        account.get("mask"),
-                        balances.get("current"),
-                        balances.get("available"),
-                        balances.get("iso_currency_code") or account.get("iso_currency_code"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                         now,
                     ),
                 )
@@ -258,7 +295,7 @@ class Storage:
                         _json(txn.get("category")),
                         _json(txn.get("personal_finance_category")),
                         1 if txn.get("pending") else 0,
-                        _json(txn),
+                        None,
                         now,
                     ),
                 )
@@ -280,20 +317,18 @@ class Storage:
                 """
                 SELECT
                     a.account_id,
-                    a.name,
-                    a.official_name,
                     a.type,
-                    a.subtype,
-                    a.mask,
-                    i.institution_name,
-                    a.current_balance,
-                    a.iso_currency_code
+                    a.subtype
                 FROM accounts a
-                LEFT JOIN items i ON i.item_id = a.item_id
-                ORDER BY COALESCE(i.institution_name, ''), a.name
+                ORDER BY a.account_id
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def account_count(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM accounts").fetchone()
+        return int(row["count"] if row else 0)
 
     def list_transactions(
         self,
@@ -313,7 +348,7 @@ class Storage:
             params.append(account_id)
 
         sql = (
-            "SELECT transaction_id, date, name, merchant_name, amount, account_id, "
+            "SELECT date, name, merchant_name, amount, "
             "category_json, personal_finance_category_json, iso_currency_code, pending, removed "
             f"FROM transactions WHERE {' AND '.join(clauses)} ORDER BY date DESC, updated_at DESC"
         )
@@ -385,9 +420,24 @@ class Storage:
         return finished_at
 
     def delete_all_plaid_data(self) -> None:
-        with self.connect() as conn:
-            conn.execute("DELETE FROM transactions")
-            conn.execute("DELETE FROM accounts")
-            conn.execute("DELETE FROM items")
-            conn.execute("DELETE FROM sync_log")
-            conn.execute("DELETE FROM settings")
+        try:
+            with self.connect() as conn:
+                conn.execute("PRAGMA secure_delete=ON")
+                conn.execute("DELETE FROM transactions")
+                conn.execute("DELETE FROM accounts")
+                conn.execute("DELETE FROM items")
+                conn.execute("DELETE FROM sync_log")
+                conn.execute("DELETE FROM settings")
+                conn.commit()
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.DatabaseError:
+                    pass
+                try:
+                    conn.execute("VACUUM")
+                except sqlite3.DatabaseError:
+                    pass
+        finally:
+            for path in [self.db_path, *self._sidecar_paths(), self.key_path]:
+                self._safe_unlink(path)
+            self.init_db()

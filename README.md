@@ -33,8 +33,12 @@ Screenshots can be added after installing the add-on and opening the Ingress das
 - Plaid secrets stay server-side in `/data/options.json` and are never returned to the browser.
 - Plaid access tokens are encrypted before they are written to SQLite.
 - The encryption key is generated locally at runtime as `local_key.key` next to the configured SQLite database.
+- Anyone with both the SQLite database and `local_key.key` can decrypt local Plaid access tokens.
+- The add-on is intended to be accessed only through Home Assistant Ingress.
+- Direct add-on port exposure is not recommended and should never be internet-facing or exposed on an untrusted LAN.
 - The dashboard never displays Plaid secrets, Plaid access tokens, public tokens, or full account numbers.
-- Do not expose this add-on directly to the internet outside Home Assistant Ingress.
+- The dashboard loads Plaid Link from Plaid. It does not load non-Plaid third-party dashboard scripts.
+- Do not paste logs, screenshots, database files, keys, or Home Assistant backups into GitHub issues or AI chats if they may contain secrets or financial data.
 
 ## Plaid setup
 
@@ -114,6 +118,8 @@ Production connects to real financial institutions and real bank data. This add-
 | `currency` | `USD` | Display currency for dashboard totals. |
 | `debug_logging` | `false` | Enables detailed server logs without printing secrets or access tokens. |
 
+`local_db_path` is restricted to `/data` in the add-on runtime. Local development outside Home Assistant can use a workspace data path when `/data` is not present.
+
 ## How monthly inflow/outflow is calculated
 
 Plaid transaction amounts are usually positive for outflows and negative for inflows.
@@ -143,6 +149,8 @@ Tables:
 
 Plaid access tokens are encrypted with a local Fernet key stored beside the database as `local_key.key`. That key is generated at runtime and must not be committed.
 
+This encryption protects against copying only the SQLite database. It does not protect tokens if someone has both the database and `local_key.key`, or if an old Home Assistant backup contains both files.
+
 ## Disconnecting and deleting data
 
 The dashboard includes `Disconnect and delete local data`.
@@ -154,8 +162,11 @@ That action deletes:
 - Linked account metadata
 - Cached transactions
 - Sync log entries
+- The local encryption key
 
-It does not delete your Plaid developer account, your Plaid app, or anything at your bank.
+The add-on also attempts SQLite cleanup by truncating WAL state, vacuuming, removing the local SQLite files, and recreating an empty database. This deletes local cached add-on data, but it is not a forensic erasure guarantee for flash storage, snapshots, or backups.
+
+It does not delete your Plaid developer account, your Plaid app, anything at your bank, or old Home Assistant backups. Delete old backups separately if they may contain older cached Plaid data.
 
 ## Troubleshooting
 
@@ -177,7 +188,7 @@ Plaid can need time before initial transactions are available. Wait a few minute
 
 ### The add-on installs but the page is blank
 
-Open the add-on log and check that Uvicorn started on `0.0.0.0:8099`. Also check browser console errors for blocked CDN access. The page still renders tables and empty states if Chart.js is unavailable.
+Open the add-on log and check that Uvicorn started on `0.0.0.0:8099`. The dashboard should be opened through Home Assistant Ingress, not through a direct container or host port.
 
 ### The repository does not appear in the add-on store
 

@@ -1,6 +1,6 @@
-fastapi
-uvicorn
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
 plaid-python==40.1.0
-pydantic
-python-dateutil
-cryptography
+pydantic>=2,<3
+python-dateutil>=2.9,<3
+cryptography>=44,<46

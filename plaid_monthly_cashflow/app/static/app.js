@@ -1,7 +1,7 @@
 const state = {
   health: null,
   monthly: null,
-  accounts: [],
+  accountCount: 0,
   merchants: [],
   cashflowChart: null,
   netChart: null,
@@ -15,10 +15,12 @@ function apiUrl(path) {
 }
 
 async function fetchJson(path, options = {}) {
+  const method = (options.method || "GET").toUpperCase();
   const response = await fetch(apiUrl(path), {
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...(method === "GET" ? {} : { "X-Plaid-Cashflow-Action": "1" }),
       ...(options.headers || {}),
     },
   });
@@ -77,6 +79,26 @@ function formatDateTime(value) {
   });
 }
 
+function textNode(tagName, text, className = "") {
+  const node = document.createElement(tagName);
+  if (className) node.className = className;
+  node.textContent = text;
+  return node;
+}
+
+function emptyMessage(text) {
+  const node = document.createElement("div");
+  node.className = "empty";
+  node.textContent = text;
+  return node;
+}
+
+function boundedPercent(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(number, 100));
+}
+
 function updateStatusAndSetup() {
   const health = state.health;
   if (!health) {
@@ -118,7 +140,7 @@ function renderMetrics() {
   $("netCashflow").textContent = formatMoney(summary.net, currency);
   $("avgNet").textContent = formatMoney(summary.average_monthly_net, currency);
   $("lastSync").textContent = formatDateTime(state.health?.last_sync_at);
-  $("accountCount").textContent = state.accounts.length;
+  $("accountCount").textContent = state.accountCount;
 
   $("netCashflow").className = Number(summary.net || 0) >= 0 ? "positive" : "negative";
   $("avgNet").className = Number(summary.average_monthly_net || 0) >= 0 ? "positive" : "negative";
@@ -130,139 +152,70 @@ function renderTable() {
   const currency = state.monthly?.currency || "USD";
 
   if (rows.length === 0) {
-    body.innerHTML = '<tr><td colspan="5">No transactions yet.</td></tr>';
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 5;
+    cell.textContent = "No transactions yet.";
+    row.appendChild(cell);
+    body.replaceChildren(row);
     return;
   }
 
-  body.innerHTML = rows
-    .map((month) => {
-      const netClass = Number(month.net || 0) >= 0 ? "positive" : "negative";
-      return `
-        <tr>
-          <td>${month.month}</td>
-          <td class="positive">${formatMoney(month.inflow, currency)}</td>
-          <td class="negative">${formatMoney(month.outflow, currency)}</td>
-          <td class="${netClass}">${formatMoney(month.net, currency)}</td>
-          <td>${month.transaction_count}</td>
-        </tr>
-      `;
-    })
-    .join("");
+  const tableRows = rows.map((month) => {
+    const row = document.createElement("tr");
+    const netClass = Number(month.net || 0) >= 0 ? "positive" : "negative";
+    row.appendChild(textNode("td", month.month || ""));
+    row.appendChild(textNode("td", formatMoney(month.inflow, currency), "positive"));
+    row.appendChild(textNode("td", formatMoney(month.outflow, currency), "negative"));
+    row.appendChild(textNode("td", formatMoney(month.net, currency), netClass));
+    row.appendChild(textNode("td", String(month.transaction_count ?? 0)));
+    return row;
+  });
+  body.replaceChildren(...tableRows);
 }
 
 function renderFallbackBars(targetId, rows, key, currency) {
   const target = $(targetId);
   if (!rows.length) {
-    target.innerHTML = '<div class="empty">No chart data yet.</div>';
+    target.replaceChildren(emptyMessage("No chart data yet."));
     return;
   }
 
   const max = Math.max(...rows.map((row) => Math.abs(Number(row[key] || 0))), 1);
-  target.innerHTML = rows
-    .map((row) => {
-      const value = Number(row[key] || 0);
-      const width = Math.max((Math.abs(value) / max) * 100, value === 0 ? 2 : 8);
-      const klass = value >= 0 ? "bar positive-bg" : "bar negative-bg";
-      return `
-        <div class="fallback-row">
-          <span>${row.month}</span>
-          <div class="fallback-track"><div class="${klass}" style="width:${width}%"></div></div>
-          <strong>${formatMoney(value, currency)}</strong>
-        </div>
-      `;
-    })
-    .join("");
+  const renderedRows = rows.map((row) => {
+    const value = Number(row[key] || 0);
+    const width = boundedPercent(Math.max((Math.abs(value) / max) * 100, value === 0 ? 2 : 8));
+    const outer = document.createElement("div");
+    outer.className = "fallback-row";
+    outer.appendChild(textNode("span", row.month || ""));
+
+    const track = document.createElement("div");
+    track.className = "fallback-track";
+    const bar = document.createElement("div");
+    bar.className = value >= 0 ? "bar positive-bg" : "bar negative-bg";
+    bar.style.width = `${width}%`;
+    track.appendChild(bar);
+
+    outer.appendChild(track);
+    outer.appendChild(textNode("strong", formatMoney(value, currency)));
+    return outer;
+  });
+  target.replaceChildren(...renderedRows);
 }
 
 function renderCharts() {
   const rows = state.monthly?.months || [];
   const currency = state.monthly?.currency || "USD";
-  const chartAvailable = Boolean(window.Chart);
-
-  $("cashflowFallback").hidden = chartAvailable;
-  $("netFallback").hidden = chartAvailable;
-  $("cashflowChart").hidden = !chartAvailable;
-  $("netChart").hidden = !chartAvailable;
-
-  if (!chartAvailable) {
-    renderFallbackBars("cashflowFallback", rows, "outflow", currency);
-    renderFallbackBars("netFallback", rows, "net", currency);
-    return;
-  }
-
-  const labels = rows.map((row) => row.month);
-  const inflow = rows.map((row) => row.inflow);
-  const outflow = rows.map((row) => row.outflow);
-  const net = rows.map((row) => row.net);
-
-  const moneyTick = (value) => formatMoney(value, currency);
-
   if (state.cashflowChart) state.cashflowChart.destroy();
-  state.cashflowChart = new Chart($("cashflowChart"), {
-    type: "bar",
-    data: {
-      labels,
-      datasets: [
-        {
-          label: "Inflow",
-          data: inflow,
-          backgroundColor: "#15803d",
-          borderRadius: 4,
-        },
-        {
-          label: "Outflow",
-          data: outflow,
-          backgroundColor: "#dc2626",
-          borderRadius: 4,
-        },
-      ],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: { position: "bottom" },
-        tooltip: {
-          callbacks: { label: (context) => `${context.dataset.label}: ${formatMoney(context.raw, currency)}` },
-        },
-      },
-      scales: {
-        y: { ticks: { callback: moneyTick }, grid: { color: "#e5e7eb" } },
-        x: { grid: { display: false } },
-      },
-    },
-  });
-
   if (state.netChart) state.netChart.destroy();
-  state.netChart = new Chart($("netChart"), {
-    type: "line",
-    data: {
-      labels,
-      datasets: [
-        {
-          label: "Net",
-          data: net,
-          borderColor: "#2563eb",
-          backgroundColor: "rgba(37, 99, 235, 0.12)",
-          tension: 0.25,
-          pointRadius: 3,
-          fill: true,
-        },
-      ],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: { display: false },
-        tooltip: { callbacks: { label: (context) => formatMoney(context.raw, currency) } },
-      },
-      scales: {
-        y: { ticks: { callback: moneyTick }, grid: { color: "#e5e7eb" } },
-        x: { grid: { display: false } },
-      },
-    },
-  });
+  state.cashflowChart = null;
+  state.netChart = null;
+  $("cashflowFallback").hidden = false;
+  $("netFallback").hidden = false;
+  $("cashflowChart").hidden = true;
+  $("netChart").hidden = true;
+  renderFallbackBars("cashflowFallback", rows, "outflow", currency);
+  renderFallbackBars("netFallback", rows, "net", currency);
 }
 
 function renderMerchants() {
@@ -270,26 +223,33 @@ function renderMerchants() {
   const merchants = state.merchants || [];
   const currency = state.monthly?.currency || "USD";
   if (!merchants.length) {
-    target.innerHTML = '<div class="empty">No merchant totals yet.</div>';
+    target.replaceChildren(emptyMessage("No merchant totals yet."));
     return;
   }
 
   const max = Math.max(...merchants.map((merchant) => Number(merchant.amount || 0)), 1);
-  target.innerHTML = merchants
-    .map((merchant) => {
-      const width = Math.max((Number(merchant.amount || 0) / max) * 100, 8);
-      return `
-        <div class="merchant-row">
-          <div>
-            <strong>${merchant.merchant}</strong>
-            <span>${merchant.transaction_count} transactions</span>
-          </div>
-          <div class="merchant-amount">${formatMoney(merchant.amount, currency)}</div>
-          <div class="merchant-track"><div style="width:${width}%"></div></div>
-        </div>
-      `;
-    })
-    .join("");
+  const renderedRows = merchants.map((merchant) => {
+    const width = boundedPercent(Math.max((Number(merchant.amount || 0) / max) * 100, 8));
+    const row = document.createElement("div");
+    row.className = "merchant-row";
+
+    const info = document.createElement("div");
+    info.appendChild(textNode("strong", merchant.merchant || "Unknown merchant"));
+    info.appendChild(textNode("span", `${merchant.transaction_count ?? 0} transactions`));
+
+    const amount = textNode("div", formatMoney(merchant.amount, currency), "merchant-amount");
+    const track = document.createElement("div");
+    track.className = "merchant-track";
+    const bar = document.createElement("div");
+    bar.style.width = `${width}%`;
+    track.appendChild(bar);
+
+    row.appendChild(info);
+    row.appendChild(amount);
+    row.appendChild(track);
+    return row;
+  });
+  target.replaceChildren(...renderedRows);
 }
 
 function renderAll() {
@@ -304,7 +264,7 @@ async function loadDashboard({ quiet = false } = {}) {
   if (!quiet) setStatus("Loading", "loading");
   clearAlert();
   try {
-    const [health, monthly, accounts, merchants] = await Promise.all([
+    const [health, monthly, accountSummary, merchants] = await Promise.all([
       fetchJson("api/health"),
       fetchJson("api/monthly-cashflow"),
       fetchJson("api/accounts"),
@@ -312,14 +272,14 @@ async function loadDashboard({ quiet = false } = {}) {
     ]);
     state.health = health;
     state.monthly = monthly;
-    state.accounts = accounts || [];
+    state.accountCount = Number(accountSummary?.count || 0);
     state.merchants = merchants || [];
     renderAll();
   } catch (error) {
     setStatus("Error", "error");
     showAlert(error.message || "Dashboard failed to load.");
     state.monthly = { currency: "USD", months: [], summary: {} };
-    state.accounts = [];
+    state.accountCount = 0;
     state.merchants = [];
     renderMetrics();
     renderTable();
@@ -376,7 +336,7 @@ async function syncNow() {
 
 async function disconnect() {
   const confirmed = window.confirm(
-    "Delete local Plaid tokens, cursors, accounts, transactions, and sync history from this add-on?"
+    "Delete local cached Plaid data from this add-on and rotate the local encryption key?"
   );
   if (!confirmed) return;
 
@@ -384,7 +344,7 @@ async function disconnect() {
   try {
     await fetchJson("api/disconnect", { method: "DELETE" });
     await loadDashboard({ quiet: true });
-    showAlert("Local Plaid data deleted.", "ok");
+    showAlert("Local cached Plaid data deleted.", "ok");
   } catch (error) {
     showAlert(error.message || "Disconnect failed.");
   }
