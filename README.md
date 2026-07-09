@@ -42,6 +42,8 @@ Create a Plaid developer account and obtain the client ID and the secret for the
 
 Use Sandbox for first setup. Sandbox uses fake institutions and fake transaction data. Production uses real bank data and should only be enabled after you are comfortable with the local storage and disconnect behavior.
 
+Make sure `plaid_env` matches the secret you paste. Use the Sandbox secret with `sandbox` and the Production secret with `production`.
+
 Required Plaid product:
 
 - `transactions`
@@ -73,6 +75,8 @@ Supported country codes in this add-on:
 6. Restart the add-on.
 7. Connect through Plaid Link yourself.
 
+Some Production institutions use OAuth. If Plaid reports that a redirect URI is required, add an HTTPS redirect URI in your Plaid dashboard and enter the same value in `plaid_redirect_uri`, then save and restart the add-on.
+
 Production connects to real financial institutions and real bank data. This add-on is for personal visualization only and does not provide financial advice.
 
 ## Home Assistant installation
@@ -101,9 +105,10 @@ Production connects to real financial institutions and real bank data. This add-
 | `plaid_client_id` | `""` | Plaid client ID from your Plaid dashboard. |
 | `plaid_secret` | `""` | Plaid environment secret. Masked by Home Assistant. |
 | `plaid_env` | `sandbox` | `sandbox` or `production`. |
+| `plaid_redirect_uri` | `""` | Optional Plaid OAuth redirect URI for Production institutions that require OAuth. Leave blank for Sandbox and non-OAuth flows. |
 | `plaid_products` | `["transactions"]` | Plaid products requested for Link. |
 | `plaid_country_codes` | `["US"]` | Plaid country codes. |
-| `sync_months_back` | `12` | Number of months used for fallback transaction pulls and default dashboard range. |
+| `sync_months_back` | `12` | Number of months requested from Plaid during Link and used for fallback transaction pulls and the default dashboard range. |
 | `sync_interval_minutes` | `360` | Background sync interval while the add-on is running. |
 | `local_db_path` | `/data/plaid_cashflow.sqlite` | SQLite database path inside the add-on data directory. |
 | `currency` | `USD` | Display currency for dashboard totals. |
@@ -161,6 +166,10 @@ Add your Plaid Client ID, Secret, and environment in the Home Assistant add-on C
 ### Plaid says the secret is invalid
 
 Check that `plaid_env` matches the credential type. Use Sandbox credentials with `sandbox` and Production credentials with `production`.
+
+### Plaid says a redirect URI is required
+
+Register the HTTPS redirect URI in the Plaid dashboard and enter the exact same value in `plaid_redirect_uri`, then save and restart the add-on.
 
 ### Transactions are not ready
 
