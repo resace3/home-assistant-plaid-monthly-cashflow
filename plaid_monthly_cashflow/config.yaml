@@ -1,5 +1,5 @@
 name: Plaid Monthly Cashflow
-version: "0.1.3"
+version: "0.1.4"
 slug: plaid_monthly_cashflow
 description: Local monthly inflow and outflow dashboard backed by Plaid transactions.
 url: https://github.com/resace3/home-assistant-plaid-monthly-cashflow
@@ -19,6 +19,7 @@ options:
   plaid_client_id: ""
   plaid_secret: ""
   plaid_env: sandbox
+  plaid_redirect_uri: ""
   plaid_products:
     - transactions
   plaid_country_codes:
@@ -32,6 +33,7 @@ schema:
   plaid_client_id: str
   plaid_secret: password
   plaid_env: list(sandbox|production)
+  plaid_redirect_uri: str
   plaid_products:
     - list(transactions)
   plaid_country_codes:
