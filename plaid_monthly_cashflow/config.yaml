@@ -1,0 +1,49 @@
+name: Plaid Monthly Cashflow
+version: "0.1.0"
+slug: plaid_monthly_cashflow
+description: Local monthly inflow and outflow dashboard backed by Plaid transactions.
+url: https://github.com/resace3/home-assistant-plaid-monthly-cashflow
+arch:
+  - aarch64
+  - amd64
+  - armv7
+startup: services
+boot: manual
+init: false
+ingress: true
+ingress_port: 8099
+ingress_entry: /
+panel_icon: mdi:bank
+panel_title: Plaid Cashflow
+ports:
+  8099/tcp: null
+options:
+  plaid_client_id: ""
+  plaid_secret: ""
+  plaid_env: sandbox
+  plaid_products:
+    - transactions
+  plaid_country_codes:
+    - US
+  sync_months_back: 12
+  sync_interval_minutes: 360
+  local_db_path: /data/plaid_cashflow.sqlite
+  currency: USD
+  debug_logging: false
+schema:
+  plaid_client_id: str
+  plaid_secret: password
+  plaid_env: list(sandbox|production)
+  plaid_products:
+    - list(transactions)
+  plaid_country_codes:
+    - list(US|CA)
+  sync_months_back: int
+  sync_interval_minutes: int
+  local_db_path: str
+  currency: str
+  debug_logging: bool
+build_from:
+  aarch64: ghcr.io/home-assistant/aarch64-base-python:3.13-alpine3.24
+  amd64: ghcr.io/home-assistant/amd64-base-python:3.13-alpine3.24
+  armv7: ghcr.io/home-assistant/armv7-base-python:3.13-alpine3.24

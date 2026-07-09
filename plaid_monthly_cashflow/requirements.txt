@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+plaid-python
+pydantic
+python-dateutil
+cryptography

@@ -1,0 +1,47 @@
+name: Basic checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r plaid_monthly_cashflow/requirements.txt
+          python -m pip install pyyaml
+
+      - name: Compile Python files
+        run: python -m compileall -q plaid_monthly_cashflow/app
+
+      - name: Import backend modules
+        run: |
+          PYTHONPATH=plaid_monthly_cashflow python - <<'PY'
+          import app.cashflow
+          import app.security
+          import app.storage
+          print("backend imports ok")
+          PY
+
+      - name: Validate YAML files
+        run: |
+          python - <<'PY'
+          import pathlib
+          import yaml
+
+          for path in [pathlib.Path("repository.yaml"), pathlib.Path("plaid_monthly_cashflow/config.yaml")]:
+              with path.open("r", encoding="utf-8") as handle:
+                  yaml.safe_load(handle)
+              print(f"{path}: ok")
+          PY

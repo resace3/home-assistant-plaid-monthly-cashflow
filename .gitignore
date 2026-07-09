@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Home Assistant add-on data and secrets.
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+local_key.key
+options.json
+
+# OS/editor noise.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

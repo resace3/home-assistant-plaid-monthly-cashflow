@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Plaid Monthly Cashflow</title>
+    <link rel="stylesheet" href="./static/styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+    <script src="./static/app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <p class="eyebrow">Home Assistant add-on</p>
+          <h1>Plaid Monthly Cashflow</h1>
+          <p class="subtitle">Local monthly inflow and outflow from your connected Plaid accounts</p>
+        </div>
+        <div id="statusPill" class="status-pill status-loading">Loading</div>
+      </section>
+
+      <section id="alert" class="alert" hidden></section>
+
+      <section class="setup-card">
+        <div>
+          <h2>Setup</h2>
+          <p id="setupText">Checking configuration...</p>
+        </div>
+        <div class="setup-facts">
+          <div>
+            <span>Environment</span>
+            <strong id="envValue">sandbox</strong>
+          </div>
+          <div>
+            <span>Linked items</span>
+            <strong id="itemsValue">0</strong>
+          </div>
+          <div>
+            <span>Transactions</span>
+            <strong id="transactionsValue">0</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="actions" aria-label="Actions">
+        <button id="connectButton" class="primary">Connect with Plaid</button>
+        <button id="syncButton">Sync now</button>
+        <button id="refreshButton">Refresh dashboard</button>
+        <button id="disconnectButton" class="danger">Disconnect and delete local data</button>
+      </section>
+
+      <section class="metrics" aria-label="Cashflow metrics">
+        <article class="metric">
+          <span>Total inflow</span>
+          <strong id="totalInflow">$0.00</strong>
+        </article>
+        <article class="metric">
+          <span>Total outflow</span>
+          <strong id="totalOutflow">$0.00</strong>
+        </article>
+        <article class="metric">
+          <span>Net cashflow</span>
+          <strong id="netCashflow">$0.00</strong>
+        </article>
+        <article class="metric">
+          <span>Average monthly net</span>
+          <strong id="avgNet">$0.00</strong>
+        </article>
+        <article class="metric">
+          <span>Last sync</span>
+          <strong id="lastSync">Never</strong>
+        </article>
+        <article class="metric">
+          <span>Linked accounts</span>
+          <strong id="accountCount">0</strong>
+        </article>
+      </section>
+
+      <section class="dashboard-grid">
+        <article class="panel panel-wide">
+          <div class="panel-heading">
+            <h2>Monthly inflow and outflow</h2>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="cashflowChart" aria-label="Monthly inflow and outflow chart"></canvas>
+            <div id="cashflowFallback" class="fallback-bars"></div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h2>Monthly net</h2>
+          </div>
+          <div class="chart-wrap compact">
+            <canvas id="netChart" aria-label="Monthly net cashflow chart"></canvas>
+            <div id="netFallback" class="fallback-bars"></div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h2>Top outflow merchants</h2>
+          </div>
+          <div id="merchantList" class="merchant-list"></div>
+        </article>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-heading">
+          <h2>Monthly cashflow</h2>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Month</th>
+                <th>Inflow</th>
+                <th>Outflow</th>
+                <th>Net</th>
+                <th>Transactions</th>
+              </tr>
+            </thead>
+            <tbody id="cashflowTable">
+              <tr>
+                <td colspan="5">Loading...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="security-notes">
+        <div>Plaid secrets stay in the add-on configuration and are never sent to the browser.</div>
+        <div>Plaid access tokens are stored locally in the add-on data directory.</div>
+        <div>Disconnect deletes local Plaid tokens and cached financial data.</div>
+      </section>
+    </main>
+  </body>
+</html>
