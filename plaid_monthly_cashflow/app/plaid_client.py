@@ -26,6 +26,7 @@ class PlaidSettings:
     products: list[str]
     country_codes: list[str]
     sync_months_back: int
+    redirect_uri: str = ""
     debug_logging: bool = False
 
     @property
@@ -97,14 +98,26 @@ class PlaidService:
             from plaid.model.country_code import CountryCode
             from plaid.model.link_token_create_request import LinkTokenCreateRequest
             from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
+            from plaid.model.link_token_transactions import LinkTokenTransactions
             from plaid.model.products import Products
 
+            products = [Products(product) for product in self.settings.products]
+            request_args = {
+                "products": products,
+                "client_name": "Home Assistant Plaid Monthly Cashflow",
+                "country_codes": [CountryCode(code) for code in self.settings.country_codes],
+                "language": "en",
+                "user": LinkTokenCreateRequestUser(client_user_id="home-assistant-local-user"),
+            }
+            if "transactions" in self.settings.products:
+                request_args["transactions"] = LinkTokenTransactions(
+                    days_requested=min(max(self.settings.sync_months_back * 31, 1), 730)
+                )
+            if self.settings.redirect_uri.strip():
+                request_args["redirect_uri"] = self.settings.redirect_uri.strip()
+
             request = LinkTokenCreateRequest(
-                products=[Products(product) for product in self.settings.products],
-                client_name="Home Assistant Plaid Monthly Cashflow",
-                country_codes=[CountryCode(code) for code in self.settings.country_codes],
-                language="en",
-                user=LinkTokenCreateRequestUser(client_user_id="home-assistant-local-user"),
+                **request_args,
             )
             response = self._get_client().link_token_create(request)
             return str(response["link_token"])
