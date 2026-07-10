@@ -48,6 +48,8 @@ Use Sandbox for first setup. Sandbox uses fake institutions and fake transaction
 
 Make sure `plaid_env` matches the secret you paste. Use the Sandbox secret with `sandbox` and the Production secret with `production`.
 
+Plaid access tokens are tied to the environment in which they were created. If you switch between Sandbox and Production, the dashboard will hide the old totals and require you to use **Disconnect and delete local data** before connecting again. Changing only the secret does not convert an existing connection.
+
 Required Plaid product:
 
 - `transactions`

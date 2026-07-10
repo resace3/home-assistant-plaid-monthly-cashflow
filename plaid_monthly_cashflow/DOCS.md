@@ -5,10 +5,11 @@
 1. Open the add-on Configuration tab.
 2. Enter your Plaid Client ID.
 3. Enter the Plaid secret for the selected environment.
-4. Choose the matching `plaid_env`.
-5. Save and restart the add-on.
-6. Open the web UI.
-7. Connect through Plaid Link.
+4. If you changed between Sandbox and Production after connecting, open the dashboard, delete the old local connection, and reconnect. Plaid access tokens cannot move between environments.
+5. Choose the matching `plaid_env`.
+6. Save and restart the add-on.
+7. Open the web UI.
+8. Connect through Plaid Link.
 
 The add-on shows a Not configured state until Plaid credentials are saved and the add-on is restarted.
 

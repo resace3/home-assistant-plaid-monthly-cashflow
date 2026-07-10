@@ -292,7 +292,7 @@ def test_storage_does_not_store_raw_json_by_default(tmp_path: Path) -> None:
 def test_delete_all_plaid_data_removes_rows_and_rotates_or_removes_key(tmp_path: Path) -> None:
     storage = Storage(str(tmp_path / "plaid_cashflow.sqlite"))
     storage.init_db()
-    storage.save_item(item_id="item-for-tests", access_token="token-for-tests")
+    storage.save_item(item_id="item-for-tests", access_token="token-for-tests", plaid_env="sandbox")
     storage.upsert_accounts("item-for-tests", [{"account_id": "account-for-tests", "name": "Should not persist"}])
     storage.upsert_transactions(
         "item-for-tests",
@@ -317,7 +317,7 @@ def test_delete_all_plaid_data_removes_rows_and_rotates_or_removes_key(tmp_path:
     for sidecar in storage._sidecar_paths():
         assert sidecar.parent == storage.db_path.parent
 
-    storage.save_item(item_id="item-for-tests", access_token="token-for-tests")
+    storage.save_item(item_id="item-for-tests", access_token="token-for-tests", plaid_env="sandbox")
     assert storage.key_path.read_bytes() != original_key
 
 
@@ -451,3 +451,68 @@ def test_invalid_config_values_are_rejected() -> None:
         main._build_config({**base, "currency": "USD<script>"})
     with pytest.raises(RuntimeError, match="sync_months_back"):
         main._build_config({**base, "sync_months_back": 36})
+
+
+def test_environment_mismatch_requires_disconnect_and_reconnect(tmp_path: Path) -> None:
+    storage = configure_test_app(tmp_path)
+    storage.save_item(
+        item_id="sandbox-item-for-tests",
+        access_token="access-sandbox-token-for-tests",
+        plaid_env="sandbox",
+    )
+    main.CONFIG = main.AddonConfig(
+        **{**main.CONFIG.__dict__, "plaid_env": "production"}
+    )
+
+    with ingress_client() as client:
+        health = client.get("/api/health")
+        sync = client.post("/api/sync", headers=ACTION_HEADERS)
+        link = client.post("/api/link-token", headers=ACTION_HEADERS)
+
+    assert health.status_code == 200
+    assert health.json()["connection_requires_reset"] is True
+    assert health.json()["connection_environment"] == "sandbox"
+    assert health.json()["connected_items"] == 0
+    assert health.json()["transaction_count"] == 0
+    assert sync.status_code == 409
+    assert link.status_code == 409
+    assert "Disconnect and delete local data" in sync.json()["detail"]
+
+
+def test_legacy_item_environment_is_inferred_from_access_token(tmp_path: Path) -> None:
+    storage = Storage(str(tmp_path / "plaid_cashflow.sqlite"))
+    storage.init_db()
+    storage.save_item(
+        item_id="legacy-item-for-tests",
+        access_token="access-sandbox-token-for-tests",
+        plaid_env="sandbox",
+    )
+    with sqlite3.connect(storage.db_path) as conn:
+        conn.execute("UPDATE items SET plaid_env = NULL")
+        conn.commit()
+
+    storage.reconcile_item_environments()
+
+    assert storage.connection_environment() == "sandbox"
+    assert storage.connection_requires_reset("production") is True
+    assert storage.connection_requires_reset("sandbox") is False
+
+
+def test_disconnect_clears_environment_mismatch(tmp_path: Path) -> None:
+    storage = configure_test_app(tmp_path)
+    storage.save_item(
+        item_id="sandbox-item-for-tests",
+        access_token="access-sandbox-token-for-tests",
+        plaid_env="sandbox",
+    )
+    main.CONFIG = main.AddonConfig(
+        **{**main.CONFIG.__dict__, "plaid_env": "production"}
+    )
+
+    with ingress_client() as client:
+        assert client.delete("/api/disconnect", headers=ACTION_HEADERS).status_code == 200
+        health = client.get("/api/health").json()
+
+    assert health["connection_requires_reset"] is False
+    assert health["connection_environment"] is None
+    assert health["connected_items"] == 0

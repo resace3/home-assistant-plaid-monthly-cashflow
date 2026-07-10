@@ -217,7 +217,7 @@ STORAGE = Storage(CONFIG.local_db_path)
 PLAID = PlaidService(CONFIG.plaid_settings())
 SYNC_LOCK = asyncio.Lock()
 
-app = FastAPI(title="Plaid Monthly Cashflow", version="0.1.6")
+app = FastAPI(title="Plaid Monthly Cashflow", version="0.1.7")
 
 
 def _trusted_ingress_networks() -> list[ipaddress._BaseNetwork]:
@@ -304,6 +304,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 @app.on_event("startup")
 async def startup() -> None:
     STORAGE.init_db()
+    STORAGE.reconcile_item_environments()
     asyncio.create_task(background_sync_loop())
 
 
@@ -325,7 +326,7 @@ async def background_sync_loop() -> None:
         await asyncio.sleep(CONFIG.sync_interval_minutes * 60)
         if not CONFIG.configured:
             continue
-        if STORAGE.connected_item_count() == 0:
+        if STORAGE.connected_item_count(CONFIG.plaid_env) == 0 or STORAGE.connection_requires_reset(CONFIG.plaid_env):
             continue
         try:
             await perform_sync()
@@ -344,6 +345,8 @@ def _safe_account_metadata(access_token: str) -> tuple[None, None, list[dict[str
 
 async def perform_sync() -> dict[str, Any]:
     async with SYNC_LOCK:
+        if STORAGE.connection_requires_reset(CONFIG.plaid_env):
+            raise HTTPException(status_code=409, detail=_environment_reset_message())
         sync_id, _ = STORAGE.start_sync_log()
         total_added = 0
         total_modified = 0
@@ -413,14 +416,26 @@ async def index() -> FileResponse:
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
+    connection_environment = STORAGE.connection_environment()
+    connection_requires_reset = STORAGE.connection_requires_reset(CONFIG.plaid_env)
     return {
         "ok": True,
         "configured": CONFIG.configured,
         "plaid_env": CONFIG.plaid_env,
-        "connected_items": STORAGE.connected_item_count(),
-        "transaction_count": STORAGE.transaction_count(),
+        "connected_items": STORAGE.connected_item_count(CONFIG.plaid_env),
+        "transaction_count": 0 if connection_requires_reset else STORAGE.transaction_count(),
         "last_sync_at": STORAGE.last_sync_at(),
+        "connection_environment": connection_environment,
+        "connection_requires_reset": connection_requires_reset,
     }
+
+
+def _environment_reset_message() -> str:
+    linked_environment = STORAGE.connection_environment() or "another environment"
+    return (
+        f"The saved Plaid connection belongs to {linked_environment}, but the add-on is configured for "
+        f"{CONFIG.plaid_env}. Disconnect and delete local data, then reconnect with Plaid."
+    )
 
 
 @app.post("/api/link-token")
@@ -430,6 +445,8 @@ async def link_token() -> dict[str, str]:
             status_code=400,
             detail="Add your Plaid Client ID, Secret, and environment in the Home Assistant add-on Configuration tab, save, and restart the add-on.",
         )
+    if STORAGE.connection_requires_reset(CONFIG.plaid_env):
+        raise HTTPException(status_code=409, detail=_environment_reset_message())
     return {"link_token": PLAID.create_link_token()}
 
 
@@ -446,6 +463,7 @@ async def exchange_public_token(payload: PublicTokenRequest) -> dict[str, Any]:
         STORAGE.save_item(
             item_id=item_id,
             access_token=access_token,
+            plaid_env=CONFIG.plaid_env,
             institution_id=institution_id,
             institution_name=institution_name,
         )
@@ -460,7 +478,9 @@ async def exchange_public_token(payload: PublicTokenRequest) -> dict[str, Any]:
 async def sync_now() -> dict[str, Any]:
     if not CONFIG.configured:
         raise HTTPException(status_code=400, detail="Plaid is not configured.")
-    if STORAGE.connected_item_count() == 0:
+    if STORAGE.connection_requires_reset(CONFIG.plaid_env):
+        raise HTTPException(status_code=409, detail=_environment_reset_message())
+    if STORAGE.connected_item_count(CONFIG.plaid_env) == 0:
         return {
             "ok": True,
             "new_transactions": 0,

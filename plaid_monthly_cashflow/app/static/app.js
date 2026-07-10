@@ -122,6 +122,16 @@ function updateStatusAndSetup() {
   $("connectButton").disabled = false;
   $("syncButton").disabled = false;
 
+  if (health.connection_requires_reset) {
+    setStatus("Reconnect required", "warning");
+    $("setupText").textContent =
+      `This connection was created in ${health.connection_environment || "another Plaid environment"}, ` +
+      `but the add-on is configured for ${health.plaid_env}. Delete local data, then reconnect with Plaid.`;
+    $("connectButton").disabled = true;
+    $("syncButton").disabled = true;
+    return;
+  }
+
   if ((health.connected_items || 0) === 0) {
     setStatus("Not connected", "neutral");
     $("setupText").textContent = "Plaid keys are configured. Connect an account to start syncing transaction data.";
@@ -264,13 +274,24 @@ async function loadDashboard({ quiet = false } = {}) {
   if (!quiet) setStatus("Loading", "loading");
   clearAlert();
   try {
-    const [health, monthly, accountSummary, merchants] = await Promise.all([
-      fetchJson("api/health"),
+    const health = await fetchJson("api/health");
+    state.health = health;
+    if (health.connection_requires_reset) {
+      state.monthly = { currency: "USD", months: [], summary: {} };
+      state.accountCount = 0;
+      state.merchants = [];
+      renderAll();
+      showAlert(
+        `The saved Plaid connection belongs to ${health.connection_environment || "another environment"}. ` +
+          `Delete local data and reconnect in ${health.plaid_env}.`
+      );
+      return;
+    }
+    const [monthly, accountSummary, merchants] = await Promise.all([
       fetchJson("api/monthly-cashflow"),
       fetchJson("api/accounts"),
       fetchJson("api/top-merchants?direction=outflow"),
     ]);
-    state.health = health;
     state.monthly = monthly;
     state.accountCount = Number(accountSummary?.count || 0);
     state.merchants = merchants || [];

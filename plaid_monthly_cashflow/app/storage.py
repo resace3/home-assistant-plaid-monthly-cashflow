@@ -86,6 +86,7 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS items (
                     item_id TEXT PRIMARY KEY,
                     access_token_encrypted TEXT NOT NULL,
+                    plaid_env TEXT,
                     institution_id TEXT,
                     institution_name TEXT,
                     cursor TEXT,
@@ -137,6 +138,9 @@ class Storage:
                 );
                 """
             )
+            item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(items)").fetchall()}
+            if "plaid_env" not in item_columns:
+                conn.execute("ALTER TABLE items ADD COLUMN plaid_env TEXT")
             conn.execute("UPDATE transactions SET raw_json = NULL WHERE raw_json IS NOT NULL")
             conn.execute(
                 """
@@ -171,6 +175,7 @@ class Storage:
         *,
         item_id: str,
         access_token: str,
+        plaid_env: str,
         institution_id: str | None = None,
         institution_name: str | None = None,
     ) -> None:
@@ -180,23 +185,24 @@ class Storage:
             conn.execute(
                 """
                 INSERT INTO items (
-                    item_id, access_token_encrypted, institution_id,
+                    item_id, access_token_encrypted, plaid_env, institution_id,
                     institution_name, cursor, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
                 ON CONFLICT(item_id) DO UPDATE SET
                     access_token_encrypted = excluded.access_token_encrypted,
+                    plaid_env = excluded.plaid_env,
                     institution_id = excluded.institution_id,
                     institution_name = excluded.institution_name,
                     updated_at = excluded.updated_at
                 """,
-                (item_id, encrypted, institution_id, institution_name, now, now),
+                (item_id, encrypted, plaid_env, institution_id, institution_name, now, now),
             )
 
     def get_items(self, *, include_tokens: bool = False) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT item_id, access_token_encrypted, institution_id, institution_name, cursor, created_at, updated_at "
+                "SELECT item_id, access_token_encrypted, plaid_env, institution_id, institution_name, cursor, created_at, updated_at "
                 "FROM items ORDER BY created_at"
             ).fetchall()
 
@@ -208,6 +214,44 @@ class Storage:
                 item["access_token"] = decrypt_text(str(encrypted), self.key_path)
             items.append(item)
         return items
+
+    def reconcile_item_environments(self) -> None:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT item_id, access_token_encrypted FROM items WHERE plaid_env IS NULL OR plaid_env = ''"
+            ).fetchall()
+            for row in rows:
+                try:
+                    token = decrypt_text(str(row["access_token_encrypted"]), self.key_path)
+                except Exception:
+                    continue
+                environment = None
+                if token.startswith("access-sandbox-"):
+                    environment = "sandbox"
+                elif token.startswith("access-production-"):
+                    environment = "production"
+                if environment:
+                    conn.execute(
+                        "UPDATE items SET plaid_env = ?, updated_at = ? WHERE item_id = ?",
+                        (environment, utc_now(), row["item_id"]),
+                    )
+
+    def connection_environment(self) -> str | None:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT plaid_env FROM items WHERE plaid_env IS NOT NULL AND plaid_env != '' ORDER BY plaid_env"
+            ).fetchall()
+            unknown_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM items WHERE plaid_env IS NULL OR plaid_env = ''"
+            ).fetchone()
+        environments = [str(row["plaid_env"]) for row in rows]
+        if unknown_count and int(unknown_count["count"]) > 0:
+            environments.append("unknown")
+        return environments[0] if len(environments) == 1 else "mixed" if environments else None
+
+    def connection_requires_reset(self, configured_env: str) -> bool:
+        environment = self.connection_environment()
+        return environment is not None and environment != configured_env
 
     def update_item_cursor(self, item_id: str, cursor: str | None) -> None:
         with self.connect() as conn:
@@ -373,9 +417,15 @@ class Storage:
             row = conn.execute("SELECT COUNT(*) AS count FROM transactions WHERE removed = 0").fetchone()
         return int(row["count"] if row else 0)
 
-    def connected_item_count(self) -> int:
+    def connected_item_count(self, plaid_env: str | None = None) -> int:
         with self.connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS count FROM items").fetchone()
+            if plaid_env is None:
+                row = conn.execute("SELECT COUNT(*) AS count FROM items").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM items WHERE plaid_env = ?",
+                    (plaid_env,),
+                ).fetchone()
         return int(row["count"] if row else 0)
 
     def last_sync_at(self) -> str | None:
