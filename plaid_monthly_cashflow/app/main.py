@@ -217,7 +217,7 @@ STORAGE = Storage(CONFIG.local_db_path)
 PLAID = PlaidService(CONFIG.plaid_settings())
 SYNC_LOCK = asyncio.Lock()
 
-app = FastAPI(title="Plaid Monthly Cashflow", version="0.1.7")
+app = FastAPI(title="Plaid Monthly Cashflow", version="0.1.8")
 
 
 def _trusted_ingress_networks() -> list[ipaddress._BaseNetwork]:
@@ -411,6 +411,12 @@ async def perform_sync() -> dict[str, Any]:
 
 @app.get("/")
 async def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/v018")
+@app.get("/v018/")
+async def versioned_index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 

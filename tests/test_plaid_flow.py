@@ -439,6 +439,18 @@ def test_no_external_chart_cdn_in_index() -> None:
     assert "cdn.jsdelivr" not in index
     assert "chart.js" not in index.lower()
     assert "https://cdn.plaid.com/link/v2/stable/link-initialize.js" in index
+    assert "app-0.1.8.js" in index
+    assert "styles-0.1.8.css" in index
+
+
+def test_versioned_ingress_entry_serves_dashboard(tmp_path: Path) -> None:
+    configure_test_app(tmp_path)
+
+    with ingress_client() as client:
+        response = client.get("/v018/")
+
+    assert response.status_code == 200
+    assert "app-0.1.8.js" in response.text
 
 
 def test_invalid_config_values_are_rejected() -> None:

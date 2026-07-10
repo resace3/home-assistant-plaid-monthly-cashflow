@@ -1,5 +1,5 @@
 name: Plaid Monthly Cashflow
-version: "0.1.7"
+version: "0.1.8"
 slug: plaid_monthly_cashflow
 description: Local monthly inflow and outflow dashboard backed by Plaid transactions.
 url: https://github.com/resace3/home-assistant-plaid-monthly-cashflow
@@ -11,6 +11,7 @@ boot: manual
 init: false
 ingress: true
 ingress_port: 8099
+ingress_entry: /v018/
 panel_icon: mdi:bank
 panel_title: Plaid Cashflow
 options:
