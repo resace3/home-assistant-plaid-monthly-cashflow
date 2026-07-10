@@ -7,7 +7,7 @@ from typing import Any
 
 from dateutil.relativedelta import relativedelta
 
-from .security import safe_error_message
+from .security import safe_error_message, scrub
 
 
 class PlaidClientError(RuntimeError):
@@ -264,7 +264,7 @@ def plaid_error_payload(exc: Exception) -> dict[str, Any]:
     body = getattr(exc, "body", None)
     if body:
         try:
-            return {"error": message, "plaid": json.loads(body)}
+            return {"error": message, "plaid": scrub(json.loads(body))}
         except ValueError:
             pass
     return {"error": message}

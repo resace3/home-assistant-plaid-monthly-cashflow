@@ -34,6 +34,31 @@ class Storage:
         self.db_path = Path(db_path)
         self.key_path = self.db_path.with_name("local_key.key")
 
+    def _sidecar_paths(self) -> list[Path]:
+        return [Path(str(self.db_path) + "-wal"), Path(str(self.db_path) + "-shm")]
+
+    def _chmod_private(self, *paths: Path) -> None:
+        for path in paths:
+            try:
+                if path.exists():
+                    os.chmod(path, 0o600)
+            except OSError:
+                pass
+
+    def _safe_unlink(self, path: Path) -> None:
+        try:
+            db_parent = self.db_path.parent.resolve(strict=False)
+            resolved = path.resolve(strict=False)
+        except OSError:
+            return
+        if resolved.parent != db_parent:
+            return
+        try:
+            if path.exists() and path.is_file():
+                path.unlink()
+        except OSError:
+            pass
+
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,11 +69,13 @@ class Storage:
             conn.commit()
         finally:
             conn.close()
+            self._chmod_private(self.db_path, *self._sidecar_paths())
 
     def init_db(self) -> None:
         with self.connect() as conn:
             conn.executescript(
                 """
+                PRAGMA secure_delete=ON;
                 PRAGMA journal_mode=WAL;
 
                 CREATE TABLE IF NOT EXISTS settings (
@@ -59,6 +86,7 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS items (
                     item_id TEXT PRIMARY KEY,
                     access_token_encrypted TEXT NOT NULL,
+                    plaid_env TEXT,
                     institution_id TEXT,
                     institution_name TEXT,
                     cursor TEXT,
@@ -110,10 +138,24 @@ class Storage:
                 );
                 """
             )
-        try:
-            os.chmod(self.db_path, 0o600)
-        except OSError:
-            pass
+            item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(items)").fetchall()}
+            if "plaid_env" not in item_columns:
+                conn.execute("ALTER TABLE items ADD COLUMN plaid_env TEXT")
+            conn.execute("UPDATE transactions SET raw_json = NULL WHERE raw_json IS NOT NULL")
+            conn.execute(
+                """
+                UPDATE accounts
+                SET name = NULL,
+                    official_name = NULL,
+                    type = NULL,
+                    subtype = NULL,
+                    mask = NULL,
+                    current_balance = NULL,
+                    available_balance = NULL,
+                    iso_currency_code = NULL
+                """
+            )
+        self._chmod_private(self.db_path, *self._sidecar_paths())
 
     def set_setting(self, key: str, value: str) -> None:
         with self.connect() as conn:
@@ -133,6 +175,7 @@ class Storage:
         *,
         item_id: str,
         access_token: str,
+        plaid_env: str,
         institution_id: str | None = None,
         institution_name: str | None = None,
     ) -> None:
@@ -142,23 +185,24 @@ class Storage:
             conn.execute(
                 """
                 INSERT INTO items (
-                    item_id, access_token_encrypted, institution_id,
+                    item_id, access_token_encrypted, plaid_env, institution_id,
                     institution_name, cursor, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
                 ON CONFLICT(item_id) DO UPDATE SET
                     access_token_encrypted = excluded.access_token_encrypted,
+                    plaid_env = excluded.plaid_env,
                     institution_id = excluded.institution_id,
                     institution_name = excluded.institution_name,
                     updated_at = excluded.updated_at
                 """,
-                (item_id, encrypted, institution_id, institution_name, now, now),
+                (item_id, encrypted, plaid_env, institution_id, institution_name, now, now),
             )
 
     def get_items(self, *, include_tokens: bool = False) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT item_id, access_token_encrypted, institution_id, institution_name, cursor, created_at, updated_at "
+                "SELECT item_id, access_token_encrypted, plaid_env, institution_id, institution_name, cursor, created_at, updated_at "
                 "FROM items ORDER BY created_at"
             ).fetchall()
 
@@ -171,6 +215,44 @@ class Storage:
             items.append(item)
         return items
 
+    def reconcile_item_environments(self) -> None:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT item_id, access_token_encrypted FROM items WHERE plaid_env IS NULL OR plaid_env = ''"
+            ).fetchall()
+            for row in rows:
+                try:
+                    token = decrypt_text(str(row["access_token_encrypted"]), self.key_path)
+                except Exception:
+                    continue
+                environment = None
+                if token.startswith("access-sandbox-"):
+                    environment = "sandbox"
+                elif token.startswith("access-production-"):
+                    environment = "production"
+                if environment:
+                    conn.execute(
+                        "UPDATE items SET plaid_env = ?, updated_at = ? WHERE item_id = ?",
+                        (environment, utc_now(), row["item_id"]),
+                    )
+
+    def connection_environment(self) -> str | None:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT plaid_env FROM items WHERE plaid_env IS NOT NULL AND plaid_env != '' ORDER BY plaid_env"
+            ).fetchall()
+            unknown_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM items WHERE plaid_env IS NULL OR plaid_env = ''"
+            ).fetchone()
+        environments = [str(row["plaid_env"]) for row in rows]
+        if unknown_count and int(unknown_count["count"]) > 0:
+            environments.append("unknown")
+        return environments[0] if len(environments) == 1 else "mixed" if environments else None
+
+    def connection_requires_reset(self, configured_env: str) -> bool:
+        environment = self.connection_environment()
+        return environment is not None and environment != configured_env
+
     def update_item_cursor(self, item_id: str, cursor: str | None) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -182,7 +264,6 @@ class Storage:
         now = utc_now()
         with self.connect() as conn:
             for account in accounts:
-                balances = account.get("balances") or {}
                 conn.execute(
                     """
                     INSERT INTO accounts (
@@ -205,14 +286,14 @@ class Storage:
                     (
                         account.get("account_id"),
                         item_id,
-                        account.get("name"),
-                        account.get("official_name"),
-                        str(account.get("type")) if account.get("type") is not None else None,
-                        str(account.get("subtype")) if account.get("subtype") is not None else None,
-                        account.get("mask"),
-                        balances.get("current"),
-                        balances.get("available"),
-                        balances.get("iso_currency_code") or account.get("iso_currency_code"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                         now,
                     ),
                 )
@@ -258,7 +339,7 @@ class Storage:
                         _json(txn.get("category")),
                         _json(txn.get("personal_finance_category")),
                         1 if txn.get("pending") else 0,
-                        _json(txn),
+                        None,
                         now,
                     ),
                 )
@@ -280,20 +361,18 @@ class Storage:
                 """
                 SELECT
                     a.account_id,
-                    a.name,
-                    a.official_name,
                     a.type,
-                    a.subtype,
-                    a.mask,
-                    i.institution_name,
-                    a.current_balance,
-                    a.iso_currency_code
+                    a.subtype
                 FROM accounts a
-                LEFT JOIN items i ON i.item_id = a.item_id
-                ORDER BY COALESCE(i.institution_name, ''), a.name
+                ORDER BY a.account_id
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def account_count(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM accounts").fetchone()
+        return int(row["count"] if row else 0)
 
     def list_transactions(
         self,
@@ -313,7 +392,7 @@ class Storage:
             params.append(account_id)
 
         sql = (
-            "SELECT transaction_id, date, name, merchant_name, amount, account_id, "
+            "SELECT date, name, merchant_name, amount, "
             "category_json, personal_finance_category_json, iso_currency_code, pending, removed "
             f"FROM transactions WHERE {' AND '.join(clauses)} ORDER BY date DESC, updated_at DESC"
         )
@@ -338,9 +417,15 @@ class Storage:
             row = conn.execute("SELECT COUNT(*) AS count FROM transactions WHERE removed = 0").fetchone()
         return int(row["count"] if row else 0)
 
-    def connected_item_count(self) -> int:
+    def connected_item_count(self, plaid_env: str | None = None) -> int:
         with self.connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS count FROM items").fetchone()
+            if plaid_env is None:
+                row = conn.execute("SELECT COUNT(*) AS count FROM items").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM items WHERE plaid_env = ?",
+                    (plaid_env,),
+                ).fetchone()
         return int(row["count"] if row else 0)
 
     def last_sync_at(self) -> str | None:
@@ -385,9 +470,24 @@ class Storage:
         return finished_at
 
     def delete_all_plaid_data(self) -> None:
-        with self.connect() as conn:
-            conn.execute("DELETE FROM transactions")
-            conn.execute("DELETE FROM accounts")
-            conn.execute("DELETE FROM items")
-            conn.execute("DELETE FROM sync_log")
-            conn.execute("DELETE FROM settings")
+        try:
+            with self.connect() as conn:
+                conn.execute("PRAGMA secure_delete=ON")
+                conn.execute("DELETE FROM transactions")
+                conn.execute("DELETE FROM accounts")
+                conn.execute("DELETE FROM items")
+                conn.execute("DELETE FROM sync_log")
+                conn.execute("DELETE FROM settings")
+                conn.commit()
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.DatabaseError:
+                    pass
+                try:
+                    conn.execute("VACUUM")
+                except sqlite3.DatabaseError:
+                    pass
+        finally:
+            for path in [self.db_path, *self._sidecar_paths(), self.key_path]:
+                self._safe_unlink(path)
+            self.init_db()

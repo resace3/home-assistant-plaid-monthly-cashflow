@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Plaid Monthly Cashflow</title>
     <link rel="stylesheet" href="./static/styles.css" />
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.min.js"></script>
     <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
     <script src="./static/app.js" defer></script>
   </head>
@@ -132,8 +131,8 @@
 
       <section class="security-notes">
         <div>Plaid secrets stay in the add-on configuration and are never sent to the browser.</div>
-        <div>Plaid access tokens are stored locally in the add-on data directory.</div>
-        <div>Disconnect deletes local Plaid tokens and cached financial data.</div>
+        <div>Plaid access tokens are encrypted locally with a key in the add-on data directory.</div>
+        <div>Disconnect deletes local cached add-on data and rotates the local key.</div>
       </section>
     </main>
   </body>

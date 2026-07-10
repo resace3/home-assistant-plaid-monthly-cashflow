@@ -6,4 +6,6 @@ Configure Plaid credentials in the add-on Configuration tab, save, restart, then
 
 For Production institutions that require OAuth, configure `plaid_redirect_uri` with a URI that is also registered in your Plaid dashboard.
 
-Do not commit Plaid secrets. Do not expose this add-on directly outside Home Assistant Ingress.
+Do not commit Plaid secrets. Use this add-on through Home Assistant Ingress only; do not expose the add-on port directly.
+
+Plaid access tokens are encrypted locally, but the encryption key is stored beside the database in the add-on data directory. Anyone with both files can decrypt the local tokens. Disconnect deletes local cached add-on data and removes the local key, but old Home Assistant backups may still contain older data.

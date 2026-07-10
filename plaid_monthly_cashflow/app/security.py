@@ -10,19 +10,32 @@ from cryptography.fernet import Fernet
 
 
 SENSITIVE_FIELD_NAMES = {
+    "account_id",
+    "account_number",
     "access_token",
     "access_token_encrypted",
-    "secret",
+    "api_key",
+    "authorization",
+    "client_secret",
+    "cursor",
+    "item_id",
+    "link_token",
+    "local_key",
+    "mask",
+    "password",
+    "api_key",
     "plaid_secret",
     "public_token",
-    "client_secret",
-    "api_key",
+    "routing_number",
+    "secret",
+    "transaction_id",
 }
 
 TOKEN_PATTERNS = [
-    re.compile(r"access-[A-Za-z0-9_-]+"),
-    re.compile(r"public-[A-Za-z0-9_-]+"),
-    re.compile(r"secret-[A-Za-z0-9_-]+"),
+    re.compile(r"\b(?:access|public|secret)-(?:sandbox|development|production)-[A-Za-z0-9_-]+\b"),
+    re.compile(r"\b(?:access|public|secret)-[A-Za-z0-9_-]{6,}\b"),
+    re.compile(r"\b[A-Za-z0-9_-]{43}=\b"),
+    re.compile(r"\b[A-Za-z0-9_-]{32,}\b"),
 ]
 
 
@@ -33,11 +46,15 @@ def redact_text(value: str) -> str:
     return redacted
 
 
+def _normalized_field_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+
+
 def scrub(value: Any) -> Any:
     if isinstance(value, dict):
         safe: dict[str, Any] = {}
         for key, item in value.items():
-            if str(key).lower() in SENSITIVE_FIELD_NAMES:
+            if _normalized_field_name(key) in SENSITIVE_FIELD_NAMES:
                 safe[key] = "[redacted]"
             else:
                 safe[key] = scrub(item)
@@ -91,10 +108,10 @@ def get_fernet(key_path: str | Path) -> Fernet:
     else:
         key = Fernet.generate_key()
         path.write_bytes(key)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
     return Fernet(key)
 
