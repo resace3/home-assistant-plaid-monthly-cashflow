@@ -10,7 +10,8 @@ const state = {
 const $ = (id) => document.getElementById(id);
 
 function apiUrl(path) {
-  const base = new URL(".", window.location.href);
+  const current = new URL(".", window.location.href);
+  const base = current.pathname.endsWith("/v018/") ? new URL("../", current) : current;
   return new URL(path.replace(/^\//, ""), base).toString();
 }
 

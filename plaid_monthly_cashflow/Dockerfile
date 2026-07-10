@@ -13,6 +13,8 @@ RUN apk add --no-cache ca-certificates libffi openssl \
     && apk del .build-deps
 
 COPY app /app/app
+RUN cp /app/app/static/app.js /app/app/static/app-0.1.8.js \
+    && cp /app/app/static/styles.css /app/app/static/styles-0.1.8.css
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
