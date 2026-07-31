@@ -3,15 +3,19 @@ const state = {
   monthly: null,
   accountCount: 0,
   merchants: [],
+  diagnostics: null,
+  diagnosticsVisible: false,
   cashflowChart: null,
   netChart: null,
 };
 
 const $ = (id) => document.getElementById(id);
 
+const VERSIONED_ENTRY = /\/v\d+\/$/;
+
 function apiUrl(path) {
   const current = new URL(".", window.location.href);
-  const base = current.pathname.endsWith("/v018/") ? new URL("../", current) : current;
+  const base = VERSIONED_ENTRY.test(current.pathname) ? new URL("../", current) : current;
   return new URL(path.replace(/^\//, ""), base).toString();
 }
 
@@ -110,6 +114,7 @@ function updateStatusAndSetup() {
   $("envValue").textContent = health.plaid_env || "sandbox";
   $("itemsValue").textContent = health.connected_items ?? 0;
   $("transactionsValue").textContent = health.transaction_count ?? 0;
+  $("eventsValue").textContent = health.transaction_event_count ?? 0;
 
   if (!health.configured) {
     setStatus("Not configured", "warning");
@@ -127,7 +132,8 @@ function updateStatusAndSetup() {
     setStatus("Reconnect required", "warning");
     $("setupText").textContent =
       `This connection was created in ${health.connection_environment || "another Plaid environment"}, ` +
-      `but the add-on is configured for ${health.plaid_env}. Delete local data, then reconnect with Plaid.`;
+      `but the add-on is configured for ${health.plaid_env}. Reconnect with Plaid in the configured ` +
+      `environment. Stored transaction history is preserved either way.`;
     $("connectButton").disabled = true;
     $("syncButton").disabled = true;
     return;
@@ -269,6 +275,7 @@ function renderAll() {
   renderTable();
   renderCharts();
   renderMerchants();
+  renderDiagnostics();
 }
 
 async function loadDashboard({ quiet = false } = {}) {
@@ -284,7 +291,7 @@ async function loadDashboard({ quiet = false } = {}) {
       renderAll();
       showAlert(
         `The saved Plaid connection belongs to ${health.connection_environment || "another environment"}. ` +
-          `Delete local data and reconnect in ${health.plaid_env}.`
+          `Reconnect in ${health.plaid_env}. Stored transaction history is preserved.`
       );
       return;
     }
@@ -348,35 +355,123 @@ async function syncNow() {
   clearAlert();
   setStatus("Syncing", "loading");
   try {
-    await fetchJson("api/sync", { method: "POST" });
+    const result = await fetchJson("api/sync", { method: "POST" });
     await loadDashboard({ quiet: true });
+    if (state.diagnosticsVisible) {
+      state.diagnostics = await fetchJson("api/diagnostics");
+      renderDiagnostics();
+    }
+    showAlert(
+      `Sync complete. ${result.inserted_events ?? 0} new ledger events, ` +
+        `${result.duplicate_events ?? 0} exact duplicates ignored.`,
+      "ok"
+    );
   } catch (error) {
     setStatus("Error", "error");
     showAlert(error.message || "Sync failed.");
   }
 }
 
-async function disconnect() {
-  const confirmed = window.confirm(
-    "Delete local cached Plaid data from this add-on and rotate the local encryption key?"
-  );
-  if (!confirmed) return;
+const DIAGNOSTIC_LABELS = [
+  ["total_transaction_events", "Total immutable transaction events"],
+  ["distinct_transaction_ids", "Distinct Plaid transaction IDs"],
+  ["active_transactions", "Current active transactions"],
+  ["pending_transactions", "Pending transactions"],
+  ["removed_transactions", "Removed transactions (retained)"],
+  ["superseded_pending_transactions", "Pending rows superseded by a posted transaction"],
+  ["modified_event_count", "Modification events recorded"],
+  ["removed_event_count", "Removal events recorded"],
+  ["legacy_import_event_count", "Legacy rows imported into the ledger"],
+  ["historical_import_event_count", "Historical backfill events"],
+  ["linked_accounts", "Linked accounts"],
+  ["accounts_with_metadata", "Accounts with stored metadata"],
+  ["account_observation_count", "Account metadata observations"],
+  ["events_with_raw_json", "Events retaining full Plaid JSON"],
+  ["earliest_transaction_date", "Earliest transaction date"],
+  ["latest_transaction_date", "Latest transaction date"],
+  ["schema_version", "Database schema version"],
+  ["app_version", "Add-on version"],
+];
 
-  clearAlert();
-  try {
-    await fetchJson("api/disconnect", { method: "DELETE" });
-    await loadDashboard({ quiet: true });
-    showAlert("Local cached Plaid data deleted.", "ok");
-  } catch (error) {
-    showAlert(error.message || "Disconnect failed.");
+function diagnosticRow(label, value) {
+  const row = document.createElement("tr");
+  row.appendChild(textNode("th", label));
+  row.appendChild(textNode("td", value === null || value === undefined ? "—" : String(value)));
+  return row;
+}
+
+function renderDiagnostics() {
+  const panel = $("diagnosticsPanel");
+  panel.hidden = !state.diagnosticsVisible;
+  if (!state.diagnosticsVisible) return;
+
+  const body = $("diagnosticsTable");
+  const data = state.diagnostics;
+  if (!data) {
+    body.replaceChildren(diagnosticRow("Status", "Loading..."));
+    return;
   }
+
+  const aggregates = data.aggregates || {};
+  const rows = DIAGNOSTIC_LABELS.map(([key, label]) => diagnosticRow(label, aggregates[key]));
+
+  const lastSync = data.last_sync || {};
+  rows.push(diagnosticRow("Last sync status", lastSync.status));
+  rows.push(diagnosticRow("Last sync finished", formatDateTime(lastSync.finished_at)));
+  rows.push(diagnosticRow("Last sync added events", lastSync.added_count));
+  rows.push(diagnosticRow("Last sync modified events", lastSync.modified_count));
+  rows.push(diagnosticRow("Last sync removed events", lastSync.removed_count));
+  rows.push(diagnosticRow("Last sync new ledger rows", lastSync.inserted_event_count));
+  rows.push(diagnosticRow("Last sync exact duplicates ignored", lastSync.duplicate_event_count));
+  rows.push(diagnosticRow("Initial backfill complete", data.backfill_complete ? "Yes" : "No"));
+  rows.push(
+    diagnosticRow("Integrity problems detected", data.integrity?.ok ? "None" : "Yes — see below")
+  );
+  rows.push(
+    diagnosticRow(
+      "Ledger hash chain",
+      data.hash_chain?.ok
+        ? `Verified (${data.hash_chain.events_checked ?? 0} events)`
+        : "Break detected"
+    )
+  );
+  body.replaceChildren(...rows);
+
+  const checks = data.integrity?.checks || [];
+  const target = $("integrityList");
+  if (!checks.length) {
+    target.replaceChildren(emptyMessage("No integrity checks reported."));
+    return;
+  }
+  const items = checks.map((check) => {
+    const row = document.createElement("div");
+    row.className = check.ok ? "integrity-row ok" : "integrity-row bad";
+    row.appendChild(textNode("span", check.ok ? "PASS" : "FAIL", "integrity-flag"));
+    row.appendChild(textNode("span", check.check));
+    if (check.detail) row.appendChild(textNode("span", check.detail, "integrity-detail"));
+    return row;
+  });
+  target.replaceChildren(...items);
+}
+
+async function toggleDiagnostics() {
+  state.diagnosticsVisible = !state.diagnosticsVisible;
+  renderDiagnostics();
+  if (!state.diagnosticsVisible) return;
+  try {
+    state.diagnostics = await fetchJson("api/diagnostics");
+  } catch (error) {
+    showAlert(error.message || "Diagnostics failed to load.");
+    state.diagnostics = null;
+  }
+  renderDiagnostics();
 }
 
 function bindActions() {
   $("connectButton").addEventListener("click", connectWithPlaid);
   $("syncButton").addEventListener("click", syncNow);
   $("refreshButton").addEventListener("click", () => loadDashboard());
-  $("disconnectButton").addEventListener("click", disconnect);
+  $("diagnosticsButton").addEventListener("click", toggleDiagnostics);
 }
 
 bindActions();

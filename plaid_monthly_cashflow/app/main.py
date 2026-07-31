@@ -7,8 +7,9 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -17,10 +18,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .cashflow import monthly_cashflow, summarize_months, top_merchants
-from .plaid_client import PlaidClientError, PlaidNotConfiguredError, PlaidService, PlaidSettings
-from .security import redact_text, safe_error_message, scrub
+from .plaid_client import (
+    PlaidClientError,
+    PlaidNotConfiguredError,
+    PlaidNotReadyError,
+    PlaidService,
+    PlaidSettings,
+)
+from .security import classify_error, redact_text, safe_error_message, scrub
 from .storage import Storage
-
+from .version import APP_VERSION, INGRESS_ENTRY
 
 LOGGER = logging.getLogger("plaid_monthly_cashflow")
 STATIC_DIR = Path(__file__).parent / "static"
@@ -58,6 +65,8 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "plaid_products": ["transactions"],
     "plaid_country_codes": ["US"],
     "sync_months_back": 12,
+    "backfill_days": 730,
+    "enable_historical_backfill": True,
     "sync_interval_minutes": 360,
     "local_db_path": "/data/plaid_cashflow.sqlite",
     "currency": "USD",
@@ -73,7 +82,11 @@ class AddonConfig:
     plaid_redirect_uri: str
     plaid_products: list[str]
     plaid_country_codes: list[str]
+    # Dashboard display range only. It never limits what the ledger stores.
     sync_months_back: int
+    # Historical backfill range, independent of the display range.
+    backfill_days: int
+    enable_historical_backfill: bool
     sync_interval_minutes: int
     local_db_path: str
     currency: str
@@ -91,6 +104,7 @@ class AddonConfig:
             products=self.plaid_products,
             country_codes=self.plaid_country_codes,
             sync_months_back=self.sync_months_back,
+            backfill_days=self.backfill_days,
             redirect_uri=self.plaid_redirect_uri,
             debug_logging=self.debug_logging,
         )
@@ -185,7 +199,19 @@ def _build_config(options: dict[str, Any]) -> AddonConfig:
         plaid_redirect_uri=_validate_redirect_uri(options.get("plaid_redirect_uri")),
         plaid_products=products,
         plaid_country_codes=country_codes,
-        sync_months_back=_bounded_int(options.get("sync_months_back") or 12, name="sync_months_back", minimum=1, maximum=24),
+        sync_months_back=_bounded_int(
+            options.get("sync_months_back") or 12,
+            name="sync_months_back",
+            minimum=1,
+            maximum=120,
+        ),
+        backfill_days=_bounded_int(
+            options.get("backfill_days") or 730,
+            name="backfill_days",
+            minimum=30,
+            maximum=730,
+        ),
+        enable_historical_backfill=bool(options.get("enable_historical_backfill", True)),
         sync_interval_minutes=_bounded_int(
             options.get("sync_interval_minutes") or 360,
             name="sync_interval_minutes",
@@ -216,8 +242,9 @@ logging.basicConfig(level=logging.DEBUG if CONFIG.debug_logging else logging.INF
 STORAGE = Storage(CONFIG.local_db_path)
 PLAID = PlaidService(CONFIG.plaid_settings())
 SYNC_LOCK = asyncio.Lock()
+BACKGROUND_SYNC_TASK: asyncio.Task | None = None
 
-app = FastAPI(title="Plaid Monthly Cashflow", version="0.1.8")
+app = FastAPI(title="Plaid Monthly Cashflow", version=APP_VERSION)
 
 
 def _trusted_ingress_networks() -> list[ipaddress._BaseNetwork]:
@@ -290,12 +317,30 @@ async def privacy_security_middleware(request: Request, call_next):
     if not _is_trusted_ingress_source(request):
         return _add_security_headers(JSONResponse(status_code=403, content={"detail": "Forbidden"}))
 
-    if _state_changing_api_request(request):
+    # Kept nested rather than collapsed: the outer test selects the requests
+    # that need CSRF protection, the inner test is the protection itself.
+    if _state_changing_api_request(request):  # noqa: SIM102
         if request.headers.get(MUTATION_HEADER) != "1" or not _origin_or_referer_matches_host(request):
             return _add_security_headers(JSONResponse(status_code=403, content={"detail": "Forbidden"}))
 
     response = await call_next(request)
     return _add_security_headers(response)
+
+
+# Frontend assets are referenced by a version-stamped filename so that neither
+# the browser nor the Home Assistant Ingress proxy can serve a stale bundle
+# after an add-on upgrade. The stamped names are served from the single source
+# file rather than duplicated at build time, so local development and the
+# container behave identically. These routes are registered before the /static
+# mount so they take precedence.
+@app.get(f"/static/app-{APP_VERSION}.js", include_in_schema=False)
+async def versioned_script() -> FileResponse:
+    return FileResponse(STATIC_DIR / "app.js", media_type="text/javascript")
+
+
+@app.get(f"/static/styles-{APP_VERSION}.css", include_in_schema=False)
+async def versioned_stylesheet() -> FileResponse:
+    return FileResponse(STATIC_DIR / "styles.css", media_type="text/css")
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -305,12 +350,19 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 async def startup() -> None:
     STORAGE.init_db()
     STORAGE.reconcile_item_environments()
-    asyncio.create_task(background_sync_loop())
+    # Keep a reference so the loop task is not garbage collected mid-flight.
+    global BACKGROUND_SYNC_TASK
+    BACKGROUND_SYNC_TASK = asyncio.create_task(background_sync_loop())
 
 
 @app.exception_handler(PlaidNotConfiguredError)
 async def plaid_not_configured_handler(_, exc: PlaidNotConfiguredError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(PlaidNotReadyError)
+async def plaid_not_ready_handler(_, exc: PlaidNotReadyError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.exception_handler(PlaidClientError)
@@ -338,74 +390,244 @@ def _http_error(exc: Exception, *, status_code: int = 500) -> HTTPException:
     return HTTPException(status_code=status_code, detail=safe_error_message(exc, debug=CONFIG.debug_logging))
 
 
-def _safe_account_metadata(access_token: str) -> tuple[None, None, list[dict[str, Any]]]:
+def _account_metadata(access_token: str) -> tuple[str | None, str | None, list[dict[str, Any]]]:
+    """Fetch accounts plus the institution they belong to.
+
+    The institution is recorded so every ledger row can be traced back to its
+    source. It is never returned to the browser.
+    """
     accounts = PLAID.get_accounts(access_token)
-    return None, None, accounts
+    institution_id = None
+    institution_name = None
+    try:
+        metadata = PLAID.get_item_metadata(access_token) or {}
+        institution_id = (metadata.get("item") or {}).get("institution_id")
+        institution_name = PLAID.get_institution_name(institution_id)
+    except Exception:  # pragma: no cover - metadata is best effort
+        LOGGER.debug("Institution metadata unavailable for an item")
+    return institution_id, institution_name, accounts
 
 
-async def perform_sync() -> dict[str, Any]:
+def _date_bounds(pages_dates: list[str]) -> tuple[str | None, str | None]:
+    valid = sorted(value for value in pages_dates if value)
+    return (valid[0], valid[-1]) if valid else (None, None)
+
+
+def _sync_one_item(item: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    """Sync a single Plaid Item, committing one page at a time.
+
+    Every page is written with :meth:`Storage.commit_sync_page`, which stores
+    the page's events and advances the cursor inside one transaction. If a
+    later page fails, the earlier pages stay committed and the cursor points at
+    the last page that succeeded -- no rollback of already-durable history.
+    """
+    item_id = str(item["item_id"])
+    access_token = item["access_token"]
+    starting_cursor = item.get("cursor")
+
+    sync_id = STORAGE.start_sync_run(
+        batch_id=batch_id, item_id=item_id, starting_cursor=starting_cursor, mode="sync"
+    )
+
+    added = modified = removed = 0
+    inserted = duplicates = pages = 0
+    dates: list[str] = []
+    ending_cursor = starting_cursor
+    mode = "sync"
+
+    try:
+        institution_id, institution_name, accounts = _account_metadata(access_token)
+        STORAGE.record_account_observations(
+            item_id,
+            accounts,
+            institution_id=institution_id,
+            institution_name=institution_name,
+            plaid_env=CONFIG.plaid_env,
+        )
+
+        for page in PLAID.sync_transaction_pages(access_token=access_token, cursor=starting_cursor):
+            mode = str(page.get("mode") or mode)
+            page_added = page.get("added") or []
+            page_modified = page.get("modified") or []
+            page_removed = page.get("removed") or []
+
+            page_inserted, page_duplicates = STORAGE.commit_sync_page(
+                item_id=item_id,
+                added=page_added,
+                modified=page_modified,
+                removed=page_removed,
+                next_cursor=page.get("next_cursor"),
+                # The transactions/get fallback has no cursor to advance.
+                advance_cursor=mode == "sync" and bool(page.get("next_cursor")),
+                batch_id=batch_id,
+                plaid_env=CONFIG.plaid_env,
+            )
+
+            added += len(page_added)
+            modified += len(page_modified)
+            removed += len(page_removed)
+            inserted += page_inserted
+            duplicates += page_duplicates
+            pages += 1
+            dates.extend(
+                str(txn.get("date"))[:10]
+                for txn in list(page_added) + list(page_modified)
+                if txn.get("date")
+            )
+            if page.get("next_cursor"):
+                ending_cursor = page["next_cursor"]
+
+        earliest, latest = _date_bounds(dates)
+        STORAGE.finish_sync_run(
+            sync_id,
+            status="ok",
+            mode=mode,
+            ending_cursor=ending_cursor,
+            added_count=added,
+            modified_count=modified,
+            removed_count=removed,
+            inserted_event_count=inserted,
+            duplicate_event_count=duplicates,
+            page_count=pages,
+            earliest_transaction_date=earliest,
+            latest_transaction_date=latest,
+        )
+    except Exception as exc:
+        earliest, latest = _date_bounds(dates)
+        STORAGE.finish_sync_run(
+            sync_id,
+            status="error",
+            mode=mode,
+            ending_cursor=ending_cursor,
+            added_count=added,
+            modified_count=modified,
+            removed_count=removed,
+            inserted_event_count=inserted,
+            duplicate_event_count=duplicates,
+            page_count=pages,
+            earliest_transaction_date=earliest,
+            latest_transaction_date=latest,
+            error_class=classify_error(exc),
+            error_message=safe_error_message(exc, debug=CONFIG.debug_logging),
+        )
+        raise
+
+    return {
+        "added": added,
+        "modified": modified,
+        "removed": removed,
+        "inserted_events": inserted,
+        "duplicate_events": duplicates,
+        "pages": pages,
+        "mode": mode,
+    }
+
+
+def _backfill_one_item(item: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    """Run the one-time date-based historical import for an Item.
+
+    This is deliberately separate from cursor-based syncing and never touches
+    the Plaid cursor: resetting a cursor is not required to backfill and would
+    risk re-delivering history the ledger already holds under a different
+    identity.
+    """
+    item_id = str(item["item_id"])
+    state = STORAGE.get_backfill_state(item_id) or {}
+    if str(state.get("status") or "") == "complete":
+        return {"status": "already_complete", "imported": 0}
+
+    start_date = PLAID.backfill_start_date()
+    end_date = date.today()
+    STORAGE.start_backfill(item_id, start_date=start_date.isoformat(), end_date=end_date.isoformat())
+
+    imported = 0
+    duplicates = 0
+    dates: list[str] = []
+    try:
+        for page in PLAID.historical_transaction_pages(
+            access_token=item["access_token"], start_date=start_date, end_date=end_date
+        ):
+            batch = page.get("added") or []
+            page_inserted, page_duplicates = STORAGE.append_historical_transactions(
+                item_id=item_id,
+                transactions=batch,
+                batch_id=batch_id,
+                plaid_env=CONFIG.plaid_env,
+            )
+            imported += page_inserted
+            duplicates += page_duplicates
+            dates.extend(str(txn.get("date"))[:10] for txn in batch if txn.get("date"))
+    except PlaidNotReadyError as exc:
+        # Retry later. Nothing already stored is removed or reset.
+        STORAGE.finish_backfill(
+            item_id, status="pending", transaction_count=imported, last_error=classify_error(exc)
+        )
+        return {"status": "pending", "imported": imported, "duplicates": duplicates}
+    except Exception as exc:
+        STORAGE.finish_backfill(
+            item_id, status="error", transaction_count=imported, last_error=classify_error(exc)
+        )
+        raise
+
+    earliest, latest = _date_bounds(dates)
+    STORAGE.finish_backfill(
+        item_id,
+        status="complete",
+        transaction_count=imported,
+        earliest=earliest,
+        latest=latest,
+    )
+    return {
+        "status": "complete",
+        "imported": imported,
+        "duplicates": duplicates,
+        "earliest_transaction_date": earliest,
+        "latest_transaction_date": latest,
+    }
+
+
+async def perform_sync(*, include_backfill: bool | None = None) -> dict[str, Any]:
+    """Sync every active Item. Only one sync may run at a time."""
+    if SYNC_LOCK.locked():
+        raise HTTPException(status_code=409, detail="A sync is already running.")
+
     async with SYNC_LOCK:
         if STORAGE.connection_requires_reset(CONFIG.plaid_env):
             raise HTTPException(status_code=409, detail=_environment_reset_message())
-        sync_id, _ = STORAGE.start_sync_log()
-        total_added = 0
-        total_modified = 0
-        total_removed = 0
-        message = "ok"
 
-        try:
-            for item in STORAGE.get_items(include_tokens=True):
-                access_token = item["access_token"]
-                accounts = PLAID.get_accounts(access_token)
-                STORAGE.upsert_accounts(item["item_id"], accounts)
+        run_backfill = CONFIG.enable_historical_backfill if include_backfill is None else include_backfill
+        batch_id = STORAGE.new_batch_id()
+        totals = {"added": 0, "modified": 0, "removed": 0, "inserted_events": 0, "duplicate_events": 0}
+        backfilled = 0
 
-                result = PLAID.sync_transactions(
-                    access_token=access_token,
-                    cursor=item.get("cursor"),
-                )
-                added = result.get("added") or []
-                modified = result.get("modified") or []
-                removed = result.get("removed") or []
-
-                STORAGE.upsert_transactions(item["item_id"], added)
-                STORAGE.upsert_transactions(item["item_id"], modified)
-                STORAGE.mark_transactions_removed(removed)
-                if result.get("next_cursor"):
-                    STORAGE.update_item_cursor(item["item_id"], result["next_cursor"])
-
-                total_added += len(added)
-                total_modified += len(modified)
-                total_removed += len(removed)
-
-                if result.get("mode") == "fallback":
-                    message = "transactions/get fallback used because transactions/sync was unavailable"
-
-            finished_at = STORAGE.finish_sync_log(
-                sync_id,
-                status="ok",
-                message=message,
-                added_count=total_added,
-                modified_count=total_modified,
-                removed_count=total_removed,
-            )
-        except Exception as exc:
-            finished_at = STORAGE.finish_sync_log(
-                sync_id,
-                status="error",
-                message=safe_error_message(exc, debug=CONFIG.debug_logging),
-                added_count=total_added,
-                modified_count=total_modified,
-                removed_count=total_removed,
-            )
-            raise
+        for item in STORAGE.get_items(include_tokens=True):
+            if run_backfill:
+                try:
+                    result = _backfill_one_item(item, batch_id)
+                    backfilled += int(result.get("imported") or 0)
+                except Exception as exc:
+                    # A failed backfill must not abort ongoing syncing.
+                    LOGGER.warning(
+                        "Historical backfill deferred: %s", redact_text(classify_error(exc))
+                    )
+            outcome = _sync_one_item(item, batch_id)
+            totals["added"] += outcome["added"]
+            totals["modified"] += outcome["modified"]
+            totals["removed"] += outcome["removed"]
+            totals["inserted_events"] += outcome["inserted_events"]
+            totals["duplicate_events"] += outcome["duplicate_events"]
 
         return {
             "ok": True,
-            "new_transactions": total_added,
-            "modified_transactions": total_modified,
-            "removed_transactions": total_removed,
+            "new_transactions": totals["added"],
+            "modified_transactions": totals["modified"],
+            "removed_transactions": totals["removed"],
+            "inserted_events": totals["inserted_events"] + backfilled,
+            "duplicate_events": totals["duplicate_events"],
+            "backfilled_events": backfilled,
             "total_transactions": STORAGE.transaction_count(),
-            "last_sync_at": finished_at,
+            "total_transaction_events": STORAGE.event_count(),
+            "last_sync_at": STORAGE.last_sync_at(),
         }
 
 
@@ -416,6 +638,8 @@ async def index() -> FileResponse:
 
 @app.get("/v018")
 @app.get("/v018/")
+@app.get(INGRESS_ENTRY.rstrip("/"))
+@app.get(INGRESS_ENTRY)
 async def versioned_index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
@@ -427,20 +651,46 @@ async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "configured": CONFIG.configured,
+        "app_version": APP_VERSION,
         "plaid_env": CONFIG.plaid_env,
         "connected_items": STORAGE.connected_item_count(CONFIG.plaid_env),
         "transaction_count": 0 if connection_requires_reset else STORAGE.transaction_count(),
+        "transaction_event_count": STORAGE.event_count(),
         "last_sync_at": STORAGE.last_sync_at(),
         "connection_environment": connection_environment,
         "connection_requires_reset": connection_requires_reset,
     }
 
 
+@app.get("/api/diagnostics")
+async def diagnostics() -> dict[str, Any]:
+    """Aggregate-only diagnostics.
+
+    Deliberately returns no transaction names, amounts, dates beyond the
+    overall range, account identifiers, raw JSON, tokens, or secrets.
+    """
+    integrity = STORAGE.integrity_report()
+    payload = {
+        "ok": True,
+        "app_version": APP_VERSION,
+        "aggregates": STORAGE.aggregate_diagnostics(),
+        "last_sync": STORAGE.last_sync_summary(),
+        "backfill_complete": STORAGE.backfill_complete(),
+        "integrity": integrity,
+        "hash_chain": STORAGE.verify_ledger_hash_chain(),
+        "append_only": True,
+    }
+    # Belt and braces: the response is scrubbed even though nothing sensitive
+    # is selected, so a future field cannot leak by accident.
+    return scrub(payload)
+
+
 def _environment_reset_message() -> str:
     linked_environment = STORAGE.connection_environment() or "another environment"
     return (
         f"The saved Plaid connection belongs to {linked_environment}, but the add-on is configured for "
-        f"{CONFIG.plaid_env}. Disconnect and delete local data, then reconnect with Plaid."
+        f"{CONFIG.plaid_env}. Disconnect the Plaid connection, then reconnect with Plaid. "
+        "Stored transaction history is always preserved."
     )
 
 
@@ -465,7 +715,7 @@ async def exchange_public_token(payload: PublicTokenRequest) -> dict[str, Any]:
         exchange = PLAID.exchange_public_token(payload.public_token)
         access_token = str(exchange["access_token"])
         item_id = str(exchange["item_id"])
-        institution_id, institution_name, accounts = _safe_account_metadata(access_token)
+        institution_id, institution_name, accounts = _account_metadata(access_token)
         STORAGE.save_item(
             item_id=item_id,
             access_token=access_token,
@@ -473,11 +723,17 @@ async def exchange_public_token(payload: PublicTokenRequest) -> dict[str, Any]:
             institution_id=institution_id,
             institution_name=institution_name,
         )
-        STORAGE.upsert_accounts(item_id, accounts)
+        STORAGE.record_account_observations(
+            item_id,
+            accounts,
+            institution_id=institution_id,
+            institution_name=institution_name,
+            plaid_env=CONFIG.plaid_env,
+        )
         sync_result = await perform_sync()
         return scrub({"ok": True, "sync": sync_result})
     except Exception as exc:
-        raise _http_error(exc, status_code=502)
+        raise _http_error(exc, status_code=502) from exc
 
 
 @app.post("/api/sync")
@@ -492,13 +748,20 @@ async def sync_now() -> dict[str, Any]:
             "new_transactions": 0,
             "modified_transactions": 0,
             "removed_transactions": 0,
-            "total_transactions": 0,
+            "inserted_events": 0,
+            "duplicate_events": 0,
+            "backfilled_events": 0,
+            # Even with no active connection the ledger keeps its history.
+            "total_transactions": STORAGE.transaction_count(),
+            "total_transaction_events": STORAGE.event_count(),
             "last_sync_at": STORAGE.last_sync_at(),
         }
     try:
         return await perform_sync()
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise _http_error(exc, status_code=502)
+        raise _http_error(exc, status_code=502) from exc
 
 
 @app.get("/api/accounts")
@@ -508,9 +771,9 @@ async def accounts() -> dict[str, int]:
 
 @app.get("/api/transactions")
 async def transactions(
-    months_back: Optional[int] = Query(default=None, ge=1, le=120),
-    limit: Optional[int] = Query(default=500, ge=1, le=5000),
-    account_id: Optional[str] = None,
+    months_back: int | None = Query(default=None, ge=1, le=120),
+    limit: int | None = Query(default=500, ge=1, le=5000),
+    account_id: str | None = None,
 ) -> list[dict[str, Any]]:
     if os.environ.get(TRANSACTIONS_API_ENV) != "1":
         raise HTTPException(status_code=404, detail="Not found")
@@ -534,7 +797,7 @@ async def transactions(
 
 @app.get("/api/monthly-cashflow")
 async def monthly_cashflow_endpoint(
-    months_back: Optional[int] = Query(default=None, ge=1, le=120),
+    months_back: int | None = Query(default=None, ge=1, le=120),
 ) -> dict[str, Any]:
     month_count = months_back or CONFIG.sync_months_back
     rows = STORAGE.list_transactions(months_back=month_count, limit=None)
@@ -548,7 +811,7 @@ async def monthly_cashflow_endpoint(
 
 @app.get("/api/top-merchants")
 async def top_merchants_endpoint(
-    months_back: Optional[int] = Query(default=None, ge=1, le=120),
+    months_back: int | None = Query(default=None, ge=1, le=120),
     direction: str = Query(default="outflow"),
 ) -> list[dict[str, Any]]:
     if direction not in {"inflow", "outflow"}:
@@ -559,5 +822,33 @@ async def top_merchants_endpoint(
 
 @app.delete("/api/disconnect")
 async def disconnect() -> dict[str, Any]:
-    STORAGE.delete_all_plaid_data()
-    return {"ok": True}
+    """Stop syncing and forget Plaid access tokens. History is preserved.
+
+    This endpoint used to call ``delete_all_plaid_data()``, which deleted every
+    transaction, account, sync-log and settings row, removed the SQLite file
+    and its WAL/SHM sidecars, deleted the local encryption key, and recreated
+    an empty database. All of that is gone.
+
+    What remains is a credential-only disconnect: Plaid is asked to deactivate
+    the Item, the encrypted access token is cleared, and the item is marked
+    inactive so background syncing stops. Not one row of financial history is
+    touched. There is no production code path that deletes financial history.
+    """
+    disconnected = 0
+    for item in STORAGE.get_items(include_tokens=True):
+        token = item.get("access_token")
+        if token:
+            PLAID.remove_item(token)
+        if STORAGE.deactivate_item(str(item["item_id"]), clear_token=True):
+            disconnected += 1
+
+    return {
+        "ok": True,
+        "disconnected_items": disconnected,
+        "financial_history_preserved": True,
+        "transaction_event_count": STORAGE.event_count(),
+        "detail": (
+            "Plaid syncing stopped and stored access tokens were cleared. "
+            "All transaction history remains in the local database."
+        ),
+    }

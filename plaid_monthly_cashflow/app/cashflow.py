@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import date, datetime
-from typing import Any, Iterable
+from typing import Any
 
 from dateutil.relativedelta import relativedelta
 
