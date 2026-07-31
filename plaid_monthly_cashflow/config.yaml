@@ -1,5 +1,5 @@
 name: Plaid Monthly Cashflow
-version: "0.1.8"
+version: "0.2.0"
 slug: plaid_monthly_cashflow
 description: Local monthly inflow and outflow dashboard backed by Plaid transactions.
 url: https://github.com/resace3/home-assistant-plaid-monthly-cashflow
@@ -11,7 +11,7 @@ boot: manual
 init: false
 ingress: true
 ingress_port: 8099
-ingress_entry: /v018/
+ingress_entry: /v020/
 panel_icon: mdi:bank
 panel_title: Plaid Cashflow
 options:
@@ -24,6 +24,8 @@ options:
   plaid_country_codes:
     - US
   sync_months_back: 12
+  backfill_days: 730
+  enable_historical_backfill: true
   sync_interval_minutes: 360
   local_db_path: /data/plaid_cashflow.sqlite
   currency: USD
@@ -37,7 +39,9 @@ schema:
     - list(transactions)
   plaid_country_codes:
     - list(US|CA)
-  sync_months_back: int
+  sync_months_back: int(1,120)
+  backfill_days: int(30,730)
+  enable_historical_backfill: bool
   sync_interval_minutes: int
   local_db_path: str
   currency: str
