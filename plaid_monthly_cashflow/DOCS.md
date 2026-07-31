@@ -110,6 +110,47 @@ amounts, account identifiers, raw payloads, tokens, or secrets.
 
 The same data is available at `GET /api/diagnostics` through Ingress.
 
+## Transaction detail (opt-in)
+
+Set `show_transaction_details: true` in the add-on Configuration tab to add a **Transactions** button
+to the dashboard. It is **off by default**.
+
+When enabled you get, for every transaction:
+
+- date, authorized date, and datetimes
+- name, merchant name, and the original bank description
+- amount, currency, and direction
+- pending / posted / removed / superseded status
+- payment channel, transaction type and code, check number
+- category, personal finance category, counterparties, location, payment metadata, website
+- which account and institution it came from, shown as a name plus Plaid's masked suffix
+
+Selecting a row shows **every stored version** of that transaction — the amount, date, merchant and
+pending state Plaid reported at each point, not just the latest. This is the append-only ledger made
+visible.
+
+The list can be searched, limited to a month range, and optionally include removed transactions.
+
+### What enabling it does and does not change
+
+It does **not** change what is stored, only what the add-on will return over HTTP. Specifically:
+
+- The endpoints stay behind Home Assistant Ingress; the same source check, CSRF header requirement,
+  and security headers apply. Nothing becomes reachable from outside Home Assistant.
+- Credential-shaped fields were stripped before the data was ever written, so there is nothing
+  sensitive left to redact in the response.
+- Full account numbers are still never stored or shown. Only Plaid's masked suffix.
+- Search is parameterised; the query text never reaches the SQL statement.
+- Result sizes are bounded (max 2000 rows per request).
+- Turning the option back off returns the endpoints to `404`.
+
+The trade-off is real and worth stating: with this on, anyone who can open your Home Assistant
+dashboard can read your full transaction history. Leave it off if other people have access to your
+Home Assistant account.
+
+`PLAID_CASHFLOW_ENABLE_TRANSACTIONS_API=1` still works as an environment override for local
+development.
+
 ## Backups
 
 Append-only storage protects you from the *application* losing data. It does not protect you from

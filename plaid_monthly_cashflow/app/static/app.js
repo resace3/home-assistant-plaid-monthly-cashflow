@@ -5,6 +5,8 @@ const state = {
   merchants: [],
   diagnostics: null,
   diagnosticsVisible: false,
+  transactions: null,
+  transactionsVisible: false,
   cashflowChart: null,
   netChart: null,
 };
@@ -115,6 +117,8 @@ function updateStatusAndSetup() {
   $("itemsValue").textContent = health.connected_items ?? 0;
   $("transactionsValue").textContent = health.transaction_count ?? 0;
   $("eventsValue").textContent = health.transaction_event_count ?? 0;
+  // The transaction browser only appears when the add-on option is on.
+  $("transactionsButton").hidden = !health.transaction_details_enabled;
 
   if (!health.configured) {
     setStatus("Not configured", "warning");
@@ -275,6 +279,7 @@ function renderAll() {
   renderTable();
   renderCharts();
   renderMerchants();
+  renderTransactions();
   renderDiagnostics();
 }
 
@@ -370,6 +375,202 @@ async function syncNow() {
     setStatus("Error", "error");
     showAlert(error.message || "Sync failed.");
   }
+}
+
+// ---------------------------------------------------------------------------
+// Transaction detail (only rendered when the add-on option is enabled)
+// ---------------------------------------------------------------------------
+
+function statusLabel(txn) {
+  if (Number(txn.removed || 0)) return "Removed";
+  if (Number(txn.superseded || 0)) return "Superseded";
+  if (Number(txn.pending || 0)) return "Pending";
+  return "Posted";
+}
+
+function categoryLabel(txn) {
+  const pfc = txn.personal_finance_category;
+  if (pfc && pfc.detailed) return String(pfc.detailed).replaceAll("_", " ").toLowerCase();
+  if (Array.isArray(txn.category) && txn.category.length) return txn.category.join(" / ");
+  return "—";
+}
+
+function accountLabel(txn) {
+  const account = txn.account || {};
+  const name = account.name || account.official_name;
+  if (name && account.mask) return `${name} ••${account.mask}`;
+  if (name) return name;
+  if (account.mask) return `••${account.mask}`;
+  return "—";
+}
+
+function detailRow(label, value) {
+  const row = document.createElement("div");
+  row.className = "detail-row";
+  row.appendChild(textNode("span", label, "detail-label"));
+  row.appendChild(textNode("span", value === null || value === undefined || value === "" ? "—" : String(value)));
+  return row;
+}
+
+function renderVersions(payload) {
+  const target = $("txnDetail");
+  const versions = payload?.versions || [];
+  const currency = state.transactions?.currency || "USD";
+  if (!versions.length) {
+    target.replaceChildren(emptyMessage("No stored versions."));
+    target.hidden = false;
+    return;
+  }
+
+  const nodes = [];
+  const heading = textNode(
+    "h3",
+    `Stored versions (${versions.length}) — every version is kept permanently`
+  );
+  nodes.push(heading);
+
+  versions.forEach((version, index) => {
+    const card = document.createElement("article");
+    card.className = "version-card";
+    card.appendChild(
+      textNode("div", `${index + 1}. ${version.event_type} — recorded ${formatDateTime(version.inserted_at)}`, "version-title")
+    );
+    card.appendChild(detailRow("Date", version.date));
+    card.appendChild(detailRow("Authorized", version.authorized_date));
+    card.appendChild(detailRow("Name", version.name));
+    card.appendChild(detailRow("Merchant", version.merchant_name));
+    card.appendChild(detailRow("Original description", version.original_description));
+    card.appendChild(
+      detailRow("Amount", version.amount === null ? null : formatMoney(version.amount, version.iso_currency_code || currency))
+    );
+    card.appendChild(detailRow("Pending", Number(version.pending || 0) ? "Yes" : "No"));
+    card.appendChild(detailRow("Payment channel", version.payment_channel));
+    card.appendChild(detailRow("Category", categoryLabel(version)));
+    card.appendChild(detailRow("Check number", version.check_number));
+    card.appendChild(detailRow("Website", version.website));
+    if (version.location && (version.location.city || version.location.address)) {
+      const parts = [version.location.address, version.location.city, version.location.region, version.location.postal_code]
+        .filter(Boolean)
+        .join(", ");
+      card.appendChild(detailRow("Location", parts));
+    }
+    if (Array.isArray(version.counterparties) && version.counterparties.length) {
+      card.appendChild(detailRow("Counterparties", version.counterparties.map((c) => c.name).filter(Boolean).join(", ")));
+    }
+    nodes.push(card);
+  });
+
+  target.replaceChildren(...nodes);
+  target.hidden = false;
+}
+
+async function showVersions(transactionId) {
+  const target = $("txnDetail");
+  target.replaceChildren(emptyMessage("Loading versions..."));
+  target.hidden = false;
+  try {
+    const payload = await fetchJson(`api/transactions/${encodeURIComponent(transactionId)}/versions`);
+    renderVersions(payload);
+  } catch (error) {
+    target.replaceChildren(emptyMessage(error.message || "Could not load versions."));
+  }
+}
+
+function renderTransactions() {
+  const panel = $("transactionsPanel");
+  panel.hidden = !state.transactionsVisible;
+  if (!state.transactionsVisible) return;
+
+  const body = $("transactionsTable");
+  const payload = state.transactions;
+  if (!payload) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 7;
+    cell.textContent = "Loading...";
+    row.appendChild(cell);
+    body.replaceChildren(row);
+    return;
+  }
+
+  const rows = payload.transactions || [];
+  const currency = payload.currency || "USD";
+  $("txnCount").textContent = `${payload.count ?? rows.length} shown`;
+
+  if (!rows.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 7;
+    cell.textContent = "No transactions match.";
+    row.appendChild(cell);
+    body.replaceChildren(row);
+    return;
+  }
+
+  const rendered = rows.map((txn) => {
+    const row = document.createElement("tr");
+    row.className = "txn-row";
+    row.tabIndex = 0;
+    row.appendChild(textNode("td", txn.date || "—"));
+    row.appendChild(textNode("td", txn.name || "—"));
+    row.appendChild(textNode("td", txn.merchant_name || "—"));
+    row.appendChild(textNode("td", accountLabel(txn)));
+    row.appendChild(textNode("td", categoryLabel(txn)));
+    row.appendChild(
+      textNode(
+        "td",
+        formatMoney(txn.amount, txn.iso_currency_code || currency),
+        `numeric ${Number(txn.amount || 0) > 0 ? "negative" : "positive"}`
+      )
+    );
+    row.appendChild(textNode("td", statusLabel(txn)));
+    const open = () => showVersions(txn.transaction_id);
+    row.addEventListener("click", open);
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        open();
+      }
+    });
+    return row;
+  });
+  body.replaceChildren(...rendered);
+}
+
+async function loadTransactions() {
+  if (!state.transactionsVisible) return;
+  const params = new URLSearchParams();
+  const months = $("txnMonths").value;
+  if (months) params.set("months_back", months);
+  const search = $("txnSearch").value.trim();
+  if (search) params.set("search", search);
+  if ($("txnIncludeRemoved").checked) params.set("include_removed", "true");
+  params.set("limit", "500");
+
+  try {
+    state.transactions = await fetchJson(`api/transactions?${params.toString()}`);
+  } catch (error) {
+    showAlert(error.message || "Could not load transactions.");
+    state.transactions = { transactions: [], count: 0 };
+  }
+  renderTransactions();
+}
+
+async function toggleTransactions() {
+  state.transactionsVisible = !state.transactionsVisible;
+  $("txnDetail").hidden = true;
+  renderTransactions();
+  if (state.transactionsVisible) await loadTransactions();
+}
+
+let searchTimer = null;
+function bindTransactionControls() {
+  $("txnSearch").addEventListener("input", () => {
+    window.clearTimeout(searchTimer);
+    searchTimer = window.setTimeout(loadTransactions, 250);
+  });
+  $("txnMonths").addEventListener("change", loadTransactions);
+  $("txnIncludeRemoved").addEventListener("change", loadTransactions);
 }
 
 const DIAGNOSTIC_LABELS = [
@@ -472,6 +673,8 @@ function bindActions() {
   $("syncButton").addEventListener("click", syncNow);
   $("refreshButton").addEventListener("click", () => loadDashboard());
   $("diagnosticsButton").addEventListener("click", toggleDiagnostics);
+  $("transactionsButton").addEventListener("click", toggleTransactions);
+  bindTransactionControls();
 }
 
 bindActions();

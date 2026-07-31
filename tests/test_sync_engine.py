@@ -116,6 +116,7 @@ def configure(tmp_path: Path, plaid: FakePlaid, **config_overrides: Any) -> Stor
         sync_interval_minutes=360,
         local_db_path=str(tmp_path / "plaid_cashflow.sqlite"),
         currency="USD",
+        show_transaction_details=False,
         debug_logging=False,
     )
     defaults.update(config_overrides)
@@ -324,6 +325,52 @@ def test_disconnect_stops_syncing_without_deleting_history(tmp_path: Path) -> No
     restarted.init_db()
     assert restarted.event_count() == before_events
     assert restarted.transaction_count() == before_transactions
+
+
+def test_sync_runs_off_the_event_loop(tmp_path: Path) -> None:
+    """A long sync must not stall the dashboard.
+
+    The Plaid SDK and sqlite3 both block. Running a first-run backfill inline
+    pinned the event loop for minutes, during which /api/health and the whole
+    dashboard stopped responding and the add-on looked dead.
+    """
+    plaid = FakePlaid([page([synthetic_transaction("txn_thread")], cursor="c1")])
+    configure(tmp_path, plaid)
+
+    loop_thread = threading.current_thread().name
+    observed: list[str] = []
+    original = main._sync_one_item
+
+    def record(item, batch_id):
+        observed.append(threading.current_thread().name)
+        return original(item, batch_id)
+
+    main._sync_one_item = record
+    try:
+        asyncio.run(main.perform_sync())
+    finally:
+        main._sync_one_item = original
+
+    assert observed and all(name != loop_thread for name in observed)
+
+
+def test_hash_chain_check_is_bounded_by_default(storage: Storage) -> None:
+    """Chain verification must not get slower forever as the ledger grows."""
+    storage.append_transaction_events(
+        item_id="i",
+        transactions=[synthetic_transaction(f"txn_chain_{index}") for index in range(50)],
+        event_type=EVENT_ADDED,
+    )
+
+    bounded = storage.verify_ledger_hash_chain(limit=10)
+    assert bounded["ok"] is True
+    assert bounded["events_checked"] == 10
+    assert bounded["total_events"] == 50
+    assert bounded["partial"] is True
+
+    full = storage.verify_ledger_hash_chain(limit=None)
+    assert full["events_checked"] == 50
+    assert full["partial"] is False
 
 
 def test_no_storage_method_deletes_financial_history() -> None:

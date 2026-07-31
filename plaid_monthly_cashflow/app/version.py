@@ -6,7 +6,7 @@ version bump cannot silently drift from the Supervisor manifest.
 
 from __future__ import annotations
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 # Bumped whenever a new migration is appended to app.schema.MIGRATIONS.
 SCHEMA_VERSION = 2

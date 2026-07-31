@@ -511,3 +511,89 @@ td {
     grid-column: 2;
   }
 }
+
+/* Transaction detail browser (opt-in, added in 0.2.1). */
+.txn-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0 1rem 0.75rem;
+  font-size: 0.85rem;
+}
+
+.txn-controls input[type="search"],
+.txn-controls select {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border, #cbd5e1);
+  border-radius: 6px;
+  font: inherit;
+  min-width: 0;
+}
+
+.txn-controls input[type="search"] {
+  flex: 1 1 14rem;
+}
+
+.txn-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+td.numeric,
+th.numeric {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.txn-row {
+  cursor: pointer;
+}
+
+.txn-row:hover,
+.txn-row:focus-visible {
+  background: var(--hover, #f1f5f9);
+  outline: none;
+}
+
+.txn-detail {
+  padding: 0.75rem 1rem 1rem;
+  border-top: 1px solid var(--border, #e2e8f0);
+}
+
+.txn-detail h3 {
+  margin: 0 0 0.6rem;
+  font-size: 0.95rem;
+}
+
+.version-card {
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 0.6rem;
+}
+
+.version-title {
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+  font-size: 0.85rem;
+}
+
+.detail-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 12rem) minmax(0, 1fr);
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  padding: 0.1rem 0;
+}
+
+.detail-label {
+  color: var(--muted, #64748b);
+}
+
+@media (max-width: 640px) {
+  .detail-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
