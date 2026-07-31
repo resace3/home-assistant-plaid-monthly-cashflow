@@ -43,6 +43,7 @@ Screenshots can be added after installing the add-on and opening the Ingress das
 - Credential-shaped fields are stripped from Plaid payloads before they are stored. Ordinary financial fields are kept in full, because the ledger exists to retain them.
 - Plaid sync cursors appear in the audit log only as a short SHA-256 fingerprint, never in cleartext.
 - The diagnostics screen and API return aggregate counters only, never transaction details.
+- Per-transaction detail is opt-in (`show_transaction_details`, default off) and stays behind Ingress. Enabling it changes what the add-on returns over HTTP, not what it stores.
 - Full account numbers are never stored. The masked suffix Plaid returns is retained as account metadata.
 - Do not paste logs, screenshots, database files, keys, or Home Assistant backups into GitHub issues or AI chats if they may contain secrets or financial data.
 
@@ -123,6 +124,7 @@ Production connects to real financial institutions and real bank data. This add-
 | `sync_months_back` | `12` | Dashboard display range in months. A display filter only; it never limits what is stored. |
 | `backfill_days` | `730` | Historical backfill range in days, and the `days_requested` value sent to Plaid Link. Plaid caps this at 730. |
 | `enable_historical_backfill` | `true` | Run the one-time date-based historical import for each connected Item. |
+| `show_transaction_details` | `false` | Adds a Transactions screen showing full per-transaction detail and every stored version. Off by default; see DOCS.md for the trade-off. |
 | `sync_interval_minutes` | `360` | Background sync interval while the add-on is running. |
 | `local_db_path` | `/data/plaid_cashflow.sqlite` | SQLite database path inside the add-on data directory. |
 | `currency` | `USD` | Display currency for dashboard totals. |

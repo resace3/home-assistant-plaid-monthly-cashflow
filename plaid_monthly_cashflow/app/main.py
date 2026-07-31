@@ -70,6 +70,7 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "sync_interval_minutes": 360,
     "local_db_path": "/data/plaid_cashflow.sqlite",
     "currency": "USD",
+    "show_transaction_details": False,
     "debug_logging": False,
 }
 
@@ -90,7 +91,14 @@ class AddonConfig:
     sync_interval_minutes: int
     local_db_path: str
     currency: str
+    # Opt-in. When false the per-transaction API returns 404 and the dashboard
+    # shows no transaction-level screen.
+    show_transaction_details: bool
     debug_logging: bool
+
+    @property
+    def transaction_details_enabled(self) -> bool:
+        return self.show_transaction_details or os.environ.get(TRANSACTIONS_API_ENV) == "1"
 
     @property
     def configured(self) -> bool:
@@ -220,6 +228,7 @@ def _build_config(options: dict[str, Any]) -> AddonConfig:
         ),
         local_db_path=_validate_db_path(options.get("local_db_path")),
         currency=currency,
+        show_transaction_details=bool(options.get("show_transaction_details")),
         debug_logging=bool(options.get("debug_logging")),
     )
 
@@ -596,39 +605,48 @@ async def perform_sync(*, include_backfill: bool | None = None) -> dict[str, Any
             raise HTTPException(status_code=409, detail=_environment_reset_message())
 
         run_backfill = CONFIG.enable_historical_backfill if include_backfill is None else include_backfill
-        batch_id = STORAGE.new_batch_id()
-        totals = {"added": 0, "modified": 0, "removed": 0, "inserted_events": 0, "duplicate_events": 0}
-        backfilled = 0
+        # The Plaid SDK and sqlite3 are both blocking. Running the whole sync
+        # inline would pin the event loop for the duration, which on a
+        # first-run backfill of several Items is minutes -- during which the
+        # dashboard, /api/health and /api/diagnostics all stop responding and
+        # the add-on looks dead. Hand the blocking work to a worker thread so
+        # the server keeps serving while a long sync runs.
+        return await asyncio.to_thread(_run_sync_blocking, run_backfill)
 
-        for item in STORAGE.get_items(include_tokens=True):
-            if run_backfill:
-                try:
-                    result = _backfill_one_item(item, batch_id)
-                    backfilled += int(result.get("imported") or 0)
-                except Exception as exc:
-                    # A failed backfill must not abort ongoing syncing.
-                    LOGGER.warning(
-                        "Historical backfill deferred: %s", redact_text(classify_error(exc))
-                    )
-            outcome = _sync_one_item(item, batch_id)
-            totals["added"] += outcome["added"]
-            totals["modified"] += outcome["modified"]
-            totals["removed"] += outcome["removed"]
-            totals["inserted_events"] += outcome["inserted_events"]
-            totals["duplicate_events"] += outcome["duplicate_events"]
 
-        return {
-            "ok": True,
-            "new_transactions": totals["added"],
-            "modified_transactions": totals["modified"],
-            "removed_transactions": totals["removed"],
-            "inserted_events": totals["inserted_events"] + backfilled,
-            "duplicate_events": totals["duplicate_events"],
-            "backfilled_events": backfilled,
-            "total_transactions": STORAGE.transaction_count(),
-            "total_transaction_events": STORAGE.event_count(),
-            "last_sync_at": STORAGE.last_sync_at(),
-        }
+def _run_sync_blocking(run_backfill: bool) -> dict[str, Any]:
+    """The synchronous body of a sync run. Executed off the event loop."""
+    batch_id = STORAGE.new_batch_id()
+    totals = {"added": 0, "modified": 0, "removed": 0, "inserted_events": 0, "duplicate_events": 0}
+    backfilled = 0
+
+    for item in STORAGE.get_items(include_tokens=True):
+        if run_backfill:
+            try:
+                result = _backfill_one_item(item, batch_id)
+                backfilled += int(result.get("imported") or 0)
+            except Exception as exc:
+                # A failed backfill must not abort ongoing syncing.
+                LOGGER.warning("Historical backfill deferred: %s", redact_text(classify_error(exc)))
+        outcome = _sync_one_item(item, batch_id)
+        totals["added"] += outcome["added"]
+        totals["modified"] += outcome["modified"]
+        totals["removed"] += outcome["removed"]
+        totals["inserted_events"] += outcome["inserted_events"]
+        totals["duplicate_events"] += outcome["duplicate_events"]
+
+    return {
+        "ok": True,
+        "new_transactions": totals["added"],
+        "modified_transactions": totals["modified"],
+        "removed_transactions": totals["removed"],
+        "inserted_events": totals["inserted_events"] + backfilled,
+        "duplicate_events": totals["duplicate_events"],
+        "backfilled_events": backfilled,
+        "total_transactions": STORAGE.transaction_count(),
+        "total_transaction_events": STORAGE.event_count(),
+        "last_sync_at": STORAGE.last_sync_at(),
+    }
 
 
 @app.get("/")
@@ -659,6 +677,20 @@ async def health() -> dict[str, Any]:
         "last_sync_at": STORAGE.last_sync_at(),
         "connection_environment": connection_environment,
         "connection_requires_reset": connection_requires_reset,
+        "transaction_details_enabled": CONFIG.transaction_details_enabled,
+    }
+
+
+def _collect_diagnostics() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "app_version": APP_VERSION,
+        "aggregates": STORAGE.aggregate_diagnostics(),
+        "last_sync": STORAGE.last_sync_summary(),
+        "backfill_complete": STORAGE.backfill_complete(),
+        "integrity": STORAGE.integrity_report(),
+        "hash_chain": STORAGE.verify_ledger_hash_chain(),
+        "append_only": True,
     }
 
 
@@ -669,17 +701,10 @@ async def diagnostics() -> dict[str, Any]:
     Deliberately returns no transaction names, amounts, dates beyond the
     overall range, account identifiers, raw JSON, tokens, or secrets.
     """
-    integrity = STORAGE.integrity_report()
-    payload = {
-        "ok": True,
-        "app_version": APP_VERSION,
-        "aggregates": STORAGE.aggregate_diagnostics(),
-        "last_sync": STORAGE.last_sync_summary(),
-        "backfill_complete": STORAGE.backfill_complete(),
-        "integrity": integrity,
-        "hash_chain": STORAGE.verify_ledger_hash_chain(),
-        "append_only": True,
-    }
+    # Diagnostics runs a dozen aggregate queries plus a hash-chain walk. Those
+    # are blocking SQLite calls, so they go to a worker thread rather than
+    # stalling the event loop for every other request.
+    payload = await asyncio.to_thread(_collect_diagnostics)
     # Belt and braces: the response is scrubbed even though nothing sensitive
     # is selected, so a future field cannot leak by accident.
     return scrub(payload)
@@ -769,30 +794,57 @@ async def accounts() -> dict[str, int]:
     return {"count": STORAGE.account_count()}
 
 
+def _require_transaction_details() -> None:
+    """Gate the per-transaction screens behind an explicit opt-in.
+
+    Off by default. When off the endpoints return 404 rather than 403, so an
+    add-on that has not opted in does not advertise that the data exists.
+    """
+    if not CONFIG.transaction_details_enabled:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
 @app.get("/api/transactions")
 async def transactions(
     months_back: int | None = Query(default=None, ge=1, le=120),
-    limit: int | None = Query(default=500, ge=1, le=5000),
-    account_id: str | None = None,
-) -> list[dict[str, Any]]:
-    if os.environ.get(TRANSACTIONS_API_ENV) != "1":
+    limit: int | None = Query(default=200, ge=1, le=2000),
+    account_id: str | None = Query(default=None, max_length=128),
+    search: str | None = Query(default=None, max_length=128),
+    include_removed: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Full detail of each transaction, for the owner's own inspection.
+
+    Reachable only through Home Assistant Ingress, only when
+    ``show_transaction_details`` is enabled. Returns the complete stored
+    financial record; credential-shaped fields were stripped before the data
+    was ever written, so there is nothing here to redact.
+    """
+    _require_transaction_details()
+    rows = await asyncio.to_thread(
+        STORAGE.list_transaction_details,
+        months_back=months_back,
+        limit=limit,
+        account_id=account_id,
+        search=search,
+        include_removed=include_removed,
+    )
+    return {"currency": CONFIG.currency, "count": len(rows), "transactions": rows}
+
+
+@app.get("/api/transactions/{transaction_id}/versions")
+async def transaction_versions(transaction_id: str) -> dict[str, Any]:
+    """Every stored version of one transaction, oldest first.
+
+    This is what append-only buys you: the amount, date, merchant and pending
+    state Plaid reported at each point, not just the latest.
+    """
+    _require_transaction_details()
+    if not transaction_id or len(transaction_id) > 128:
+        raise HTTPException(status_code=400, detail="Invalid transaction id")
+    versions = await asyncio.to_thread(STORAGE.transaction_versions, transaction_id)
+    if not versions:
         raise HTTPException(status_code=404, detail="Not found")
-    rows = STORAGE.list_transactions(months_back=months_back, limit=limit, account_id=account_id)
-    return [
-        {
-            "date": row.get("date"),
-            "name": row.get("name"),
-            "merchant_name": row.get("merchant_name"),
-            "amount": row.get("amount"),
-            "iso_currency_code": row.get("iso_currency_code"),
-            "category": row.get("category"),
-            "personal_finance_category": row.get("personal_finance_category"),
-            "pending": row.get("pending"),
-            "removed": row.get("removed"),
-            "direction": row.get("direction"),
-        }
-        for row in rows
-    ]
+    return {"transaction_id": transaction_id, "version_count": len(versions), "versions": versions}
 
 
 @app.get("/api/monthly-cashflow")

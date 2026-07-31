@@ -22,7 +22,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from dateutil.relativedelta import relativedelta
 
@@ -722,6 +722,162 @@ class Storage:
             transactions.append(item)
         return transactions
 
+    # Columns returned by the detailed transaction views. Deliberately explicit
+    # rather than SELECT *: adding a column to the ledger must be a conscious
+    # decision to expose it, not an automatic one.
+    _DETAIL_COLUMNS = (
+        "transaction_id",
+        "date",
+        "authorized_date",
+        "datetime",
+        "authorized_datetime",
+        "name",
+        "merchant_name",
+        "original_description",
+        "amount",
+        "iso_currency_code",
+        "unofficial_currency_code",
+        "pending",
+        "removed",
+        "superseded",
+        "pending_transaction_id",
+        "payment_channel",
+        "transaction_type",
+        "transaction_code",
+        "category_json",
+        "category_id",
+        "personal_finance_category_json",
+        "personal_finance_category_icon_url",
+        "counterparties_json",
+        "location_json",
+        "payment_meta_json",
+        "website",
+        "logo_url",
+        "merchant_entity_id",
+        "check_number",
+        "account_owner",
+        "account_id",
+        "first_seen_at",
+        "state_event_id",
+    )
+
+    _JSON_FIELDS: ClassVar[dict[str, str]] = {
+        "category_json": "category",
+        "personal_finance_category_json": "personal_finance_category",
+        "counterparties_json": "counterparties",
+        "location_json": "location",
+        "payment_meta_json": "payment_meta",
+    }
+
+    def _expand(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        for column, name in self._JSON_FIELDS.items():
+            if column in item:
+                item[name] = json.loads(item.pop(column) or "null")
+        amount = item.get("amount") or 0
+        item["direction"] = "outflow" if amount > 0 else "inflow" if amount < 0 else "neutral"
+        return item
+
+    def list_transaction_details(
+        self,
+        *,
+        months_back: int | None = None,
+        limit: int | None = 500,
+        account_id: str | None = None,
+        search: str | None = None,
+        include_removed: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Full per-transaction detail for the owner's own inspection screen.
+
+        Reads the derived current-state view, so each transaction appears once
+        at its latest known version. Set ``include_removed`` to also list
+        transactions Plaid has since removed -- they are never deleted, only
+        excluded from totals.
+        """
+        clauses: list[str] = [] if include_removed else ["removed = 0", "superseded = 0"]
+        params: list[Any] = []
+        if months_back is not None and months_back > 0:
+            start = date.today().replace(day=1) - relativedelta(months=months_back - 1)
+            clauses.append("date >= ?")
+            params.append(start.isoformat())
+        if account_id:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        if search:
+            # Parameterised LIKE; the wildcards are added to the value, never
+            # to the SQL text.
+            clauses.append("(name LIKE ? OR merchant_name LIKE ? OR original_description LIKE ?)")
+            needle = f"%{search}%"
+            params.extend([needle, needle, needle])
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        columns = ", ".join(self._DETAIL_COLUMNS)
+        sql = (
+            f"SELECT {columns} FROM transaction_current_state {where} "
+            "ORDER BY date DESC, state_event_id DESC"
+        )
+        if limit is not None and limit > 0:
+            sql += " LIMIT ?"
+            params.append(limit)
+
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            accounts = {
+                str(row["account_id"]): dict(row)
+                for row in conn.execute(
+                    "SELECT account_id, name, official_name, mask, type, subtype, "
+                    "institution_name FROM account_latest_state"
+                ).fetchall()
+            }
+
+        details: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._expand(row)
+            account = accounts.get(str(item.get("account_id")) or "", {})
+            # A human-readable account label beats a raw Plaid id on screen.
+            item["account"] = {
+                "name": account.get("name"),
+                "official_name": account.get("official_name"),
+                "mask": account.get("mask"),
+                "type": account.get("type"),
+                "subtype": account.get("subtype"),
+                "institution_name": account.get("institution_name"),
+            }
+            details.append(item)
+        return details
+
+    def transaction_versions(self, transaction_id: str) -> list[dict[str, Any]]:
+        """Every stored version of one transaction, oldest first, in full.
+
+        This is the append-only guarantee made visible: a modified transaction
+        shows each prior amount, date, merchant and pending state rather than
+        only its current value.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT event_id, event_type, event_class, supersedes_event_id, "
+                "plaid_transaction_id AS transaction_id, pending_transaction_id, account_id, "
+                "txn_date AS date, authorized_date, txn_datetime AS datetime, authorized_datetime, "
+                "name, merchant_name, original_description, amount, iso_currency_code, "
+                "unofficial_currency_code, pending, payment_channel, transaction_type, "
+                "transaction_code, category_json, category_id, personal_finance_category_json, "
+                "counterparties_json, location_json, payment_meta_json, website, logo_url, "
+                "merchant_entity_id, check_number, account_owner, raw_json, payload_hash, "
+                "inserted_at, received_at "
+                "FROM transaction_events WHERE plaid_transaction_id = ? ORDER BY event_id",
+                (transaction_id,),
+            ).fetchall()
+
+        versions: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._expand(row)
+            raw = item.pop("raw_json", None)
+            # raw_json had credential-shaped keys stripped before it was ever
+            # written, so returning it exposes financial fields only.
+            item["raw"] = json.loads(raw) if raw else None
+            versions.append(item)
+        return versions
+
     def transaction_history(self, transaction_id: str) -> list[dict[str, Any]]:
         """Every stored version of one transaction, oldest first."""
         with self.connect() as conn:
@@ -1090,7 +1246,7 @@ class Storage:
         problems = [check["check"] for check in checks if not check["ok"]]
         return {"ok": not problems, "problems": problems, "checks": checks}
 
-    def verify_ledger_hash_chain(self, *, limit: int | None = None) -> dict[str, Any]:
+    def verify_ledger_hash_chain(self, *, limit: int | None = 2000) -> dict[str, Any]:
         """Recompute the optional tamper-evidence hash chain.
 
         This detects *later* edits made directly against SQLite by someone who
@@ -1098,18 +1254,28 @@ class Storage:
         proofing: an administrator with write access to the file can rewrite
         both the rows and the chain. See DOCS.md.
         """
-        sql = (
-            "SELECT event_id, event_identity, payload_hash, inserted_at, prev_ledger_hash, ledger_hash "
-            "FROM transaction_events ORDER BY event_id"
-        )
-        params: list[Any] = []
+        # Verify the most recent `limit` events rather than the whole ledger.
+        # The chain is O(n) forever, and a diagnostics request must not get
+        # slower every month. Passing limit=None checks everything.
         if limit:
-            sql += " LIMIT ?"
-            params.append(limit)
+            sql = (
+                "SELECT * FROM ("
+                "  SELECT event_id, event_identity, payload_hash, inserted_at, prev_ledger_hash, "
+                "         ledger_hash FROM transaction_events ORDER BY event_id DESC LIMIT ?"
+                ") ORDER BY event_id"
+            )
+            params: list[Any] = [limit]
+        else:
+            sql = (
+                "SELECT event_id, event_identity, payload_hash, inserted_at, prev_ledger_hash, "
+                "ledger_hash FROM transaction_events ORDER BY event_id"
+            )
+            params = []
 
         checked = 0
         breaks: list[int] = []
         with self.connect() as conn:
+            total = int(conn.execute("SELECT COUNT(*) FROM transaction_events").fetchone()[0] or 0)
             previous: str | None = None
             for row in conn.execute(sql, params):
                 if row["ledger_hash"] is None:
@@ -1128,4 +1294,12 @@ class Storage:
                     breaks.append(int(row["event_id"]))
                 previous = str(row["ledger_hash"])
                 checked += 1
-        return {"ok": not breaks, "events_checked": checked, "break_count": len(breaks)}
+        return {
+            "ok": not breaks,
+            "events_checked": checked,
+            "break_count": len(breaks),
+            # Rows migrated from the pre-ledger schema carry no chain, so
+            # `events_checked` is legitimately lower than the ledger size.
+            "total_events": total,
+            "partial": bool(limit) and total > limit,
+        }

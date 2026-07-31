@@ -165,7 +165,8 @@ def test_api_accounts_response_minimized(tmp_path: Path) -> None:
         assert forbidden not in response.text
 
 
-def test_api_transactions_absent_or_minimized(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_api_transactions_absent_until_opted_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off by default; the env override still works for local development."""
     from app.schema import EVENT_ADDED
 
     storage = configure(tmp_path, FakePlaid([]))
@@ -183,9 +184,7 @@ def test_api_transactions_absent_or_minimized(tmp_path: Path, monkeypatch: pytes
         response = client.get("/api/transactions")
 
     assert response.status_code == 200
-    for forbidden in ("transaction_id", "account_id", "raw_json"):
-        assert forbidden not in response.text
-    assert response.json()[0]["merchant_name"] == "Synthetic Market"
+    assert response.json()["transactions"][0]["merchant_name"] == "Synthetic Market"
 
 
 def test_state_changing_routes_require_mutation_header(tmp_path: Path) -> None:
