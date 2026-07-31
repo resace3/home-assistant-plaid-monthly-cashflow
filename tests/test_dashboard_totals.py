@@ -125,6 +125,34 @@ def test_inflow_and_outflow_split_and_month_range(storage: Storage) -> None:
     assert by_month["2026-05"]["outflow"] == 250.0
 
 
+def test_current_state_view_scales_linearly(storage: Storage) -> None:
+    """Guard against the O(n^2) correlated-subquery form returning.
+
+    The original ``superseded`` definition re-evaluated the latest-state view
+    once per row. At ~2,500 events a single COUNT over the view took seconds
+    and the diagnostics endpoint timed out in production.
+    """
+    import time
+
+    storage.append_transaction_events(
+        item_id="i",
+        transactions=[
+            synthetic_transaction(f"txn_scale_{index}", date="2026-05-01", amount=float(index))
+            for index in range(1500)
+        ],
+        event_type=EVENT_ADDED,
+    )
+
+    started = time.monotonic()
+    with storage.connect() as conn:
+        conn.execute("SELECT COUNT(*) FROM transaction_active_state").fetchone()
+        conn.execute("SELECT COUNT(*) FROM transaction_current_state WHERE superseded = 1").fetchone()
+    elapsed = time.monotonic() - started
+
+    # Generous ceiling: the correlated form took several seconds at this size.
+    assert elapsed < 2.0, f"current-state views degraded to {elapsed:.2f}s"
+
+
 def test_dashboard_range_does_not_limit_stored_history(storage: Storage) -> None:
     """sync_months_back is a display filter, not a retention policy."""
     storage.append_transaction_events(

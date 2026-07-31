@@ -393,16 +393,24 @@ LEFT JOIN newest_removal r ON r.plaid_transaction_id = ids.plaid_transaction_id;
 -- transaction_id and points at the old one through pending_transaction_id.
 -- The pending row must stay in the ledger and stay queryable, but it must not
 -- be counted a second time in dashboard totals, so it is flagged superseded.
+--
+-- Implemented as a LEFT JOIN against a single pass over the pending links
+-- rather than a correlated EXISTS. The correlated form re-evaluated
+-- transaction_latest_state once per row, which was O(n^2): on a real ledger of
+-- ~2,500 events a single COUNT(*) over this view took seconds, and the
+-- diagnostics endpoint timed out. The join form is a small constant number of
+-- passes.
 DROP VIEW IF EXISTS transaction_current_state;
 CREATE VIEW transaction_current_state AS
 SELECT
     ls.*,
-    CASE WHEN EXISTS (
-        SELECT 1 FROM transaction_latest_state posted
-        WHERE posted.pending_transaction_id = ls.transaction_id
-          AND posted.removed = 0
-    ) THEN 1 ELSE 0 END AS superseded
-FROM transaction_latest_state ls;
+    CASE WHEN linked.pending_transaction_id IS NOT NULL THEN 1 ELSE 0 END AS superseded
+FROM transaction_latest_state ls
+LEFT JOIN (
+    SELECT DISTINCT pending_transaction_id
+    FROM transaction_latest_state
+    WHERE pending_transaction_id IS NOT NULL AND removed = 0
+) linked ON linked.pending_transaction_id = ls.transaction_id;
 
 -- The rows the dashboard is allowed to total: newest state, not removed, not
 -- superseded by a posted counterpart.
