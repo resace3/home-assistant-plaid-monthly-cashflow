@@ -4,9 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Plaid Monthly Cashflow</title>
-    <link rel="stylesheet" href="../static/styles-0.1.8.css" />
+    <link rel="stylesheet" href="../static/styles-0.2.0.css" />
     <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
-    <script src="../static/app-0.1.8.js" defer></script>
+    <script src="../static/app-0.2.0.js" defer></script>
   </head>
   <body>
     <main class="shell">
@@ -39,14 +39,24 @@
             <span>Transactions</span>
             <strong id="transactionsValue">0</strong>
           </div>
+          <div>
+            <span>Ledger events</span>
+            <strong id="eventsValue">0</strong>
+          </div>
         </div>
       </section>
 
+      <!--
+        The former destructive disconnect control has been removed. It deleted
+        every stored transaction, account, and sync row, plus the SQLite file
+        and the local encryption key. Financial history in this add-on is
+        append-only, so no dashboard control erases it.
+      -->
       <section class="actions" aria-label="Actions">
         <button id="connectButton" class="primary">Connect with Plaid</button>
         <button id="syncButton">Sync now</button>
         <button id="refreshButton">Refresh dashboard</button>
-        <button id="disconnectButton" class="danger">Disconnect and delete local data</button>
+        <button id="diagnosticsButton">Diagnostics</button>
       </section>
 
       <section class="metrics" aria-label="Cashflow metrics">
@@ -129,10 +139,33 @@
         </div>
       </section>
 
+      <section id="diagnosticsPanel" class="panel table-panel" hidden>
+        <div class="panel-heading">
+          <h2>Diagnostics</h2>
+          <p class="panel-note">
+            Aggregate counts only. This view never shows transaction names, amounts, account
+            identifiers, tokens, or secrets.
+          </p>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <tbody id="diagnosticsTable">
+              <tr>
+                <td colspan="2">Loading...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="integrityList" class="integrity-list"></div>
+      </section>
+
       <section class="security-notes">
         <div>Plaid secrets stay in the add-on configuration and are never sent to the browser.</div>
         <div>Plaid access tokens are encrypted locally with a key in the add-on data directory.</div>
-        <div>Disconnect deletes local cached add-on data and rotates the local key.</div>
+        <div>
+          Transaction history is append-only. Syncing, restarting, and disconnecting never delete
+          stored transaction events.
+        </div>
       </section>
     </main>
   </body>

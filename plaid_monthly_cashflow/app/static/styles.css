@@ -463,3 +463,51 @@ td {
     grid-column: 2;
   }
 }
+
+/* Diagnostics panel (aggregate-only, added in 0.2.0). */
+.panel-note {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted, #64748b);
+}
+
+.integrity-list {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.75rem 1rem 1rem;
+}
+
+.integrity-row {
+  display: grid;
+  grid-template-columns: 3.5rem minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0.5rem;
+  align-items: baseline;
+  font-size: 0.85rem;
+}
+
+.integrity-flag {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.integrity-row.ok .integrity-flag {
+  color: #15803d;
+}
+
+.integrity-row.bad .integrity-flag {
+  color: #b91c1c;
+}
+
+.integrity-detail {
+  color: var(--muted, #64748b);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .integrity-row {
+    grid-template-columns: 3.5rem minmax(0, 1fr);
+  }
+  .integrity-detail {
+    grid-column: 2;
+  }
+}
