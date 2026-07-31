@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
-
-from dateutil.relativedelta import relativedelta
 
 from .security import safe_error_message, scrub
 
@@ -18,6 +18,15 @@ class PlaidNotConfiguredError(PlaidClientError):
     pass
 
 
+class PlaidNotReadyError(PlaidClientError):
+    """Plaid is still preparing transaction data for this Item.
+
+    Raised instead of a generic failure so callers can retry later without
+    treating the run as a hard error -- and, critically, without ever deleting
+    or resetting anything that is already stored.
+    """
+
+
 @dataclass(frozen=True)
 class PlaidSettings:
     client_id: str
@@ -26,12 +35,24 @@ class PlaidSettings:
     products: list[str]
     country_codes: list[str]
     sync_months_back: int
+    backfill_days: int = 730
     redirect_uri: str = ""
     debug_logging: bool = False
 
     @property
     def configured(self) -> bool:
         return bool(self.client_id.strip() and self.secret.strip())
+
+    @property
+    def link_days_requested(self) -> int:
+        """Days of history to request at Link time.
+
+        Plaid caps ``days_requested`` at 730. The dashboard's display range
+        (``sync_months_back``) must not constrain how much history the
+        permanent ledger is allowed to hold, so Link always asks for the
+        backfill range instead.
+        """
+        return min(max(self.backfill_days, 1), 730)
 
 
 def _to_dict(value: Any) -> Any:
@@ -90,6 +111,10 @@ class PlaidService:
         return self._client
 
     def _raise_clean(self, exc: Exception) -> None:
+        if _is_product_not_ready(exc):
+            raise PlaidNotReadyError(
+                "Plaid transactions are not ready yet. Wait a few minutes and sync again."
+            ) from exc
         raise PlaidClientError(safe_error_message(exc, debug=self.settings.debug_logging)) from exc
 
     def create_link_token(self) -> str:
@@ -111,7 +136,7 @@ class PlaidService:
             }
             if "transactions" in self.settings.products:
                 request_args["transactions"] = LinkTokenTransactions(
-                    days_requested=min(max(self.settings.sync_months_back * 31, 1), 730)
+                    days_requested=self.settings.link_days_requested
                 )
             if self.settings.redirect_uri.strip():
                 request_args["redirect_uri"] = self.settings.redirect_uri.strip()
@@ -175,88 +200,175 @@ class PlaidService:
         except Exception as exc:
             self._raise_clean(exc)
 
-    def sync_transactions(
+    def remove_item(self, access_token: str) -> bool:
+        """Ask Plaid to deactivate the Item. Local history is unaffected."""
+        try:
+            from plaid.model.item_remove_request import ItemRemoveRequest
+
+            self._get_client().item_remove(ItemRemoveRequest(access_token=access_token))
+            return True
+        except Exception:
+            # Losing the remote deactivation must not block the local
+            # disconnect, and it must never escalate into a data deletion.
+            return False
+
+    def sync_transaction_pages(
         self,
         *,
         access_token: str,
         cursor: str | None,
-    ) -> dict[str, Any]:
-        client = self._get_client()
-        if hasattr(client, "transactions_sync"):
-            return self._transactions_sync(access_token=access_token, cursor=cursor)
-        return self._transactions_get_fallback(access_token=access_token)
+        page_size: int = 500,
+        max_pages: int = 200,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield one ``transactions/sync`` page at a time.
 
-    def _transactions_sync(self, *, access_token: str, cursor: str | None) -> dict[str, Any]:
+        Pages are yielded rather than accumulated so the caller can commit each
+        page's events *together with* its cursor. That is what makes cursor
+        advancement crash-safe: the cursor never moves ahead of durably stored
+        events, and a crash mid-run simply replays the last page, which then
+        deduplicates.
+        """
+        client = self._get_client()
+        if not hasattr(client, "transactions_sync"):
+            yield from self._transactions_get_pages(
+                access_token=access_token,
+                start_date=self.backfill_start_date(),
+                end_date=date.today(),
+                mode="fallback",
+            )
+            return
+
         try:
             from plaid.model.transactions_sync_request import TransactionsSyncRequest
+        except ImportError as exc:  # pragma: no cover - plaid package guarantees this
+            raise PlaidClientError("The plaid-python package is not installed.") from exc
 
-            added: list[dict[str, Any]] = []
-            modified: list[dict[str, Any]] = []
-            removed: list[dict[str, Any]] = []
-            next_cursor = cursor
-            has_more = True
+        next_cursor = cursor
+        pages = 0
+        while pages < max_pages:
+            request_args: dict[str, Any] = {"access_token": access_token, "count": page_size}
+            # Plaid rejects an explicit null cursor; omitting it means "from the
+            # beginning of this Item's available history".
+            if next_cursor:
+                request_args["cursor"] = next_cursor
 
-            while has_more:
-                request_args = {
-                    "access_token": access_token,
-                    "count": 500,
-                }
-                if next_cursor is not None:
-                    request_args["cursor"] = next_cursor
+            try:
+                response = _to_dict(
+                    self._get_client().transactions_sync(TransactionsSyncRequest(**request_args))
+                ) or {}
+            except Exception as exc:
+                self._raise_clean(exc)
+                return
 
-                request = TransactionsSyncRequest(**request_args)
-                response = _to_dict(self._get_client().transactions_sync(request)) or {}
-                added.extend(response.get("added") or [])
-                modified.extend(response.get("modified") or [])
-                removed.extend(response.get("removed") or [])
-                next_cursor = response.get("next_cursor")
-                has_more = bool(response.get("has_more"))
-
-            return {
+            next_cursor = response.get("next_cursor")
+            has_more = bool(response.get("has_more"))
+            pages += 1
+            yield {
                 "mode": "sync",
-                "added": added,
-                "modified": modified,
-                "removed": removed,
+                "added": response.get("added") or [],
+                "modified": response.get("modified") or [],
+                "removed": response.get("removed") or [],
                 "next_cursor": next_cursor,
+                "has_more": has_more,
             }
-        except Exception as exc:
-            self._raise_clean(exc)
+            if not has_more:
+                return
 
-    def _transactions_get_fallback(self, *, access_token: str) -> dict[str, Any]:
+    def backfill_start_date(self) -> date:
+        return date.today() - timedelta(days=max(self.settings.backfill_days, 1))
+
+    def historical_transaction_pages(
+        self,
+        *,
+        access_token: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield pages of ``transactions/get`` for a first-time backfill.
+
+        Plaid only holds as much history as the Item was linked for, so an
+        early ``start_date`` simply returns whatever is available rather than
+        failing. The caller reports the earliest and latest dates actually
+        retrieved.
+        """
+        yield from self._transactions_get_pages(
+            access_token=access_token,
+            start_date=start_date or self.backfill_start_date(),
+            end_date=end_date or date.today(),
+            mode="backfill",
+        )
+
+    def _transactions_get_pages(
+        self,
+        *,
+        access_token: str,
+        start_date: date,
+        end_date: date,
+        mode: str,
+        page_size: int = 500,
+        max_pages: int = 500,
+        max_retries: int = 3,
+    ) -> Iterator[dict[str, Any]]:
         try:
             from plaid.model.transactions_get_request import TransactionsGetRequest
             from plaid.model.transactions_get_request_options import TransactionsGetRequestOptions
+        except ImportError as exc:  # pragma: no cover
+            raise PlaidClientError("The plaid-python package is not installed.") from exc
 
-            end_date = date.today()
-            start_date = end_date - relativedelta(months=self.settings.sync_months_back)
-            transactions: list[dict[str, Any]] = []
-            offset = 0
-            total = None
+        offset = 0
+        total: int | None = None
+        pages = 0
 
-            while total is None or offset < total:
-                request = TransactionsGetRequest(
-                    access_token=access_token,
-                    start_date=start_date,
-                    end_date=end_date,
-                    options=TransactionsGetRequestOptions(count=500, offset=offset),
-                )
-                response = _to_dict(self._get_client().transactions_get(request)) or {}
-                batch = response.get("transactions") or []
-                transactions.extend(batch)
-                total = int(response.get("total_transactions") or len(transactions))
-                offset += len(batch)
-                if not batch:
+        while pages < max_pages and (total is None or offset < total):
+            request = TransactionsGetRequest(
+                access_token=access_token,
+                start_date=start_date,
+                end_date=end_date,
+                options=TransactionsGetRequestOptions(count=page_size, offset=offset),
+            )
+            attempt = 0
+            while True:
+                try:
+                    response = _to_dict(self._get_client().transactions_get(request)) or {}
                     break
+                except Exception as exc:
+                    # Retry only the transient "still preparing" case, and only
+                    # a bounded number of times. Nothing stored is touched.
+                    if _is_product_not_ready(exc) and attempt < max_retries - 1:
+                        attempt += 1
+                        time.sleep(min(2 ** attempt, 8))
+                        continue
+                    self._raise_clean(exc)
+                    return
 
-            return {
-                "mode": "fallback",
-                "added": transactions,
+            batch = response.get("transactions") or []
+            total = int(response.get("total_transactions") or (offset + len(batch)))
+            offset += len(batch)
+            pages += 1
+            yield {
+                "mode": mode,
+                "added": batch,
                 "modified": [],
                 "removed": [],
                 "next_cursor": None,
+                "has_more": offset < total and bool(batch),
+                "total": total,
             }
-        except Exception as exc:
-            self._raise_clean(exc)
+            if not batch:
+                return
+
+
+def _is_product_not_ready(exc: BaseException) -> bool:
+    body = getattr(exc, "body", None)
+    if body:
+        try:
+            code = str(json.loads(body).get("error_code") or "")
+        except (TypeError, ValueError):
+            code = ""
+        if code in {"PRODUCT_NOT_READY", "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION"}:
+            return True
+    lowered = str(exc).lower()
+    return "product_not_ready" in lowered or "transactions not ready" in lowered
 
 
 def plaid_error_payload(exc: Exception) -> dict[str, Any]:
