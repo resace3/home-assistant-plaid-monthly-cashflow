@@ -23,17 +23,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r plaid_monthly_cashflow/requirements.txt
-          python -m pip install pyyaml pytest httpx
+          python -m pip install pyyaml pytest httpx ruff
 
       - name: Compile Python files
         run: python -m compileall -q plaid_monthly_cashflow/app
 
+      - name: Lint
+        run: python -m ruff check plaid_monthly_cashflow/app tests
+
       - name: Import backend modules
         run: |
           PYTHONPATH=plaid_monthly_cashflow python - <<'PY'
+          import app.canonical
           import app.cashflow
+          import app.schema
           import app.security
           import app.storage
+          import app.version
           print("backend imports ok")
           PY
 
@@ -49,5 +55,58 @@ jobs:
               print(f"{path}: ok")
           PY
 
-      - name: Run unit tests
+      - name: Verify add-on version consistency
+        run: |
+          PYTHONPATH=plaid_monthly_cashflow python - <<'PY'
+          import pathlib
+          import yaml
+          from app.version import APP_VERSION, INGRESS_ENTRY
+
+          config = yaml.safe_load(pathlib.Path("plaid_monthly_cashflow/config.yaml").read_text())
+          index = pathlib.Path("plaid_monthly_cashflow/app/static/index.html").read_text()
+          assert config["version"] == APP_VERSION, (config["version"], APP_VERSION)
+          assert config["ingress_entry"] == INGRESS_ENTRY, (config["ingress_entry"], INGRESS_ENTRY)
+          assert f"app-{APP_VERSION}.js" in index
+          assert config["ingress"] is True
+          print(f"add-on version {APP_VERSION} is consistent")
+          PY
+
+      - name: Run unit and integration tests
         run: PYTHONPATH=plaid_monthly_cashflow pytest -q
+
+      - name: Audit for destructive operations
+        run: PYTHONPATH=plaid_monthly_cashflow pytest -q tests/test_no_destructive_operations.py
+
+      - name: Migration and integrity smoke test on a temporary database
+        run: |
+          PYTHONPATH=plaid_monthly_cashflow python - <<'PY'
+          import sqlite3
+          import tempfile
+          from pathlib import Path
+
+          from app.storage import Storage
+
+          with tempfile.TemporaryDirectory() as tmp:
+              db = Path(tmp) / "smoke.sqlite"
+              store = Storage(str(db))
+              store.init_db()
+              store.init_db()  # idempotent
+              report = store.integrity_report()
+              assert report["ok"], report["problems"]
+              with sqlite3.connect(db) as conn:
+                  assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+              print("migration + integrity check ok")
+          PY
+
+  addon-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate the add-on Dockerfile builds
+        run: |
+          docker build \
+            --build-arg BUILD_ARCH=amd64 \
+            --tag plaid-monthly-cashflow:ci \
+            plaid_monthly_cashflow
